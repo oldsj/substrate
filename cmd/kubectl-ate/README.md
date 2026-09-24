@@ -252,6 +252,9 @@ kubectl ate create egress-policy <actor-name> -a <atespace> -f policy.yaml
 # Copy the egress policy of another actor.
 kubectl ate get egress-policy <src-actor> -a <atespace> -o yaml | \
   kubectl ate create egress-policy <actor-name> -a <atespace> -f -
+
+# Replace an actor's egress policy.
+kubectl ate update egress-policy <actor-name> -a <atespace> -f policy.yaml
 ```
 
 The manifest is one `EgressPolicy` in YAML or JSON; `metadata` may be omitted
@@ -260,6 +263,12 @@ manifest as is.
 
 `get` exits 1 when the actor does not exist; an actor without a policy prints a
 note on stderr and exits 0.
+
+`update` replaces the whole policy. If the manifest's metadata sets both `uid`
+and `version`, as `get -o yaml` output does, they are preconditions: the update
+fails if the policy changed since it was read. If it sets neither, the current
+policy is replaced whatever its version. `update` fails when the actor has no
+policy yet; use `create` for that.
 
 #### `kubectl ate get egress-policy` output columns
 
