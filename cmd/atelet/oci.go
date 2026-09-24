@@ -123,18 +123,31 @@ func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, acto
 		return err
 	}
 
-	// Argv and env need only the image config; resolve them before writing
-	// any spec so an invalid container config fails fast.
+	// Resolve the process from the image before writing any spec so an
+	// invalid container config fails fast.
 	resolvedArgs, err := resolveProcessArgs(&img.Config, command, args)
 	if err != nil {
 		return fmt.Errorf("while resolving process args for container %q: %w", containerName, err)
 	}
 	resolvedEnv := resolveActorEnv(&img.Config, env)
+	user, err := resolveProcessUser(img.ReadFile, img.Config.User)
+	if err != nil {
+		return fmt.Errorf("while resolving process user for container %q: %w", containerName, err)
+	}
+	cwd, err := resolveWorkingDir(img.Config.WorkingDir)
+	if err != nil {
+		return fmt.Errorf("while resolving working directory for container %q: %w", containerName, err)
+	}
 
 	// Every bind target must exist in the rootfs for the mount to attach;
 	// ateom creates them through the mounted overlay (they land in the
 	// actor's upper).
+	// The working directory must exist too; images built with WORKDIR
+	// already have it.
 	var extraDirs []string
+	if cwd != "/" {
+		extraDirs = append(extraDirs, cwd)
+	}
 	for _, vm := range volumeMounts {
 		extraDirs = append(extraDirs, vm.GetMountPath())
 	}
@@ -153,6 +166,9 @@ func prepareOCIDirectory(ctx context.Context, imageCache *imagecache.Store, acto
 		ContainerName: containerName,
 		Args:          resolvedArgs,
 		Env:           resolvedEnv,
+		UID:           user.UID,
+		GID:           user.GID,
+		Cwd:           cwd,
 		NetNSPath:     netns,
 		Volumes:       volumes,
 		VolumeMounts:  volumeMounts,
