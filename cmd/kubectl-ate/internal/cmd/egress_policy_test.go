@@ -392,6 +392,9 @@ func TestEgressPolicyCommandArgs(t *testing.T) {
 		{name: "create", command: createEgressPolicyCmd, args: []string{"c1"}},
 		{name: "create requires actor", command: createEgressPolicyCmd, wantErr: true},
 		{name: "create rejects multiple", command: createEgressPolicyCmd, args: []string{"c1", "c2"}, wantErr: true},
+		{name: "update", command: updateEgressPolicyCmd, args: []string{"c1"}},
+		{name: "update requires actor", command: updateEgressPolicyCmd, wantErr: true},
+		{name: "update rejects multiple", command: updateEgressPolicyCmd, args: []string{"c1", "c2"}, wantErr: true},
 	})
 }
 
@@ -646,6 +649,139 @@ rules:
 			}
 			if diff := cmp.Diff(wantReq, test.creator.req, protocmp.Transform()); diff != "" {
 				t.Errorf("request mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(test.wantOut, stdout.String()); diff != "" {
+				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// fakeEgressPolicyUpdater answers the reads like fakeEgressPolicyGetter and
+// records the update request it received. updateReq stays nil unless the
+// runner sends an update.
+type fakeEgressPolicyUpdater struct {
+	fakeEgressPolicyGetter
+	updateReq *ateapipb.UpdateActorEgressPolicyRequest
+	updated   *ateapipb.EgressPolicy
+	updateErr error
+}
+
+func (f *fakeEgressPolicyUpdater) UpdateActorEgressPolicy(ctx context.Context, req *ateapipb.UpdateActorEgressPolicyRequest, opts ...grpc.CallOption) (*ateapipb.EgressPolicy, error) {
+	f.updateReq = proto.Clone(req).(*ateapipb.UpdateActorEgressPolicyRequest)
+	if f.updateErr != nil {
+		return nil, f.updateErr
+	}
+	return f.updated, nil
+}
+
+func TestUpdateEgressPolicyRunner_Run(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	pinTime(t, now)
+
+	actor := &ateapipb.ObjectRef{Atespace: "team-a", Name: "c1"}
+	const uid = "3f2b1c0e-8d5a-4b6e-9c1d-2a7e4f6b8c0d"
+	oldRules := []*ateapipb.EgressRule{{Hostnames: &ateapipb.HostnameRule{Patterns: []string{"old.example.com"}}}}
+	newRules := []*ateapipb.EgressRule{{Hostnames: &ateapipb.HostnameRule{Patterns: []string{"api.example.com"}}}}
+	current := &ateapipb.EgressPolicy{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "default", Uid: uid, Version: 3, CreateTime: timestamppb.New(now)},
+		Rules:    oldRules,
+	}
+	updated := &ateapipb.EgressPolicy{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "default", Uid: uid, Version: 4, CreateTime: timestamppb.New(now)},
+		Rules:    newRules,
+	}
+	manifest := func(uid string, version int64) *ateapipb.EgressPolicy {
+		return &ateapipb.EgressPolicy{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "default", Uid: uid, Version: version},
+			Rules:    newRules,
+		}
+	}
+	notFound := status.Error(codes.NotFound, "not found")
+
+	tests := []struct {
+		name          string
+		policy        *ateapipb.EgressPolicy
+		updater       *fakeEgressPolicyUpdater
+		wantUpdateReq *ateapipb.UpdateActorEgressPolicyRequest
+		wantOut       string
+		wantErr       string
+	}{
+		{
+			name:          "preconditions come from the current policy when the manifest has none",
+			policy:        manifest("", 0),
+			updater:       &fakeEgressPolicyUpdater{fakeEgressPolicyGetter: fakeEgressPolicyGetter{policy: current}, updated: updated},
+			wantUpdateReq: &ateapipb.UpdateActorEgressPolicyRequest{Actor: actor, EgressPolicy: manifest(uid, 3)},
+			wantOut: `ATESPACE   ACTOR   RULES   VERSION   AGE
+team-a     c1      1       4         0s
+`,
+		},
+		{
+			name:          "manifest preconditions are sent as is",
+			policy:        manifest(uid, 2),
+			updater:       &fakeEgressPolicyUpdater{fakeEgressPolicyGetter: fakeEgressPolicyGetter{policy: current}, updateErr: status.Error(codes.FailedPrecondition, "version mismatch")},
+			wantUpdateReq: &ateapipb.UpdateActorEgressPolicyRequest{Actor: actor, EgressPolicy: manifest(uid, 2)},
+			wantErr:       `failed to update egress policy for actor "c1" in atespace "team-a": rpc error: code = FailedPrecondition desc = version mismatch`,
+		},
+		{
+			name:    "uid without version is rejected",
+			policy:  manifest(uid, 0),
+			updater: &fakeEgressPolicyUpdater{},
+			wantErr: "manifest metadata must set both uid and version, or neither",
+		},
+		{
+			name:    "version without uid is rejected",
+			policy:  manifest("", 3),
+			updater: &fakeEgressPolicyUpdater{},
+			wantErr: "manifest metadata must set both uid and version, or neither",
+		},
+		{
+			name:    "actor without a policy",
+			policy:  manifest("", 0),
+			updater: &fakeEgressPolicyUpdater{fakeEgressPolicyGetter: fakeEgressPolicyGetter{err: notFound}},
+			wantErr: `actor "c1" in atespace "team-a" has no egress policy; create one with "kubectl ate create egress-policy"`,
+		},
+		{
+			name:    "missing actor",
+			policy:  manifest("", 0),
+			updater: &fakeEgressPolicyUpdater{fakeEgressPolicyGetter: fakeEgressPolicyGetter{err: notFound, actorErr: notFound}},
+			wantErr: `actor "c1" in atespace "team-a" not found`,
+		},
+		{
+			name:          "policy deleted between read and update",
+			policy:        manifest("", 0),
+			updater:       &fakeEgressPolicyUpdater{fakeEgressPolicyGetter: fakeEgressPolicyGetter{policy: current}, updateErr: notFound},
+			wantUpdateReq: &ateapipb.UpdateActorEgressPolicyRequest{Actor: actor, EgressPolicy: manifest(uid, 3)},
+			wantErr:       `actor "c1" in atespace "team-a" has no egress policy; create one with "kubectl ate create egress-policy"`,
+		},
+		{
+			name:    "read failure wraps",
+			policy:  manifest("", 0),
+			updater: &fakeEgressPolicyUpdater{fakeEgressPolicyGetter: fakeEgressPolicyGetter{err: status.Error(codes.Unavailable, "down")}},
+			wantErr: `failed to get egress policy for actor "c1" in atespace "team-a": rpc error: code = Unavailable desc = down`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			runner := &updateEgressPolicyRunner{
+				updater:   test.updater,
+				actor:     actor,
+				policy:    test.policy,
+				outputFmt: "table",
+				stdout:    &stdout,
+			}
+			err := runner.Run(context.Background())
+			gotErr := ""
+			if err != nil {
+				gotErr = err.Error()
+			}
+			if gotErr != test.wantErr {
+				t.Fatalf("Run() error = %q, want %q", gotErr, test.wantErr)
+			}
+			if diff := cmp.Diff(test.wantUpdateReq, test.updater.updateReq, protocmp.Transform()); diff != "" {
+				t.Errorf("update request mismatch (-want +got):\n%s", diff)
 			}
 			if diff := cmp.Diff(test.wantOut, stdout.String()); diff != "" {
 				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
