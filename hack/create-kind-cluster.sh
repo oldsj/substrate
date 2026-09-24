@@ -36,6 +36,19 @@ if [[ $# -gt 0 ]]; then
   esac
 fi
 
+# DISABLE_DEFAULT_CNI=true skips kindnet so a CNI such as Cilium can be
+# installed afterwards. KIND_CONFIG_ONLY=1 writes bin/kind-config.yaml and exits
+# without touching any cluster. KIND_NODE_IMAGE overrides the node image.
+DISABLE_DEFAULT_CNI="${DISABLE_DEFAULT_CNI:-false}"
+case "${DISABLE_DEFAULT_CNI}" in
+  true|false)
+    ;;
+  *)
+    echo "DISABLE_DEFAULT_CNI must be true or false, got '${DISABLE_DEFAULT_CNI}'" >&2
+    exit 1
+    ;;
+esac
+
 # Only ipFamily is set; kind's per-family podSubnet/serviceSubnet defaults are
 # already what we want.
 IP_FAMILY="${IP_FAMILY:-ipv4}"
@@ -112,6 +125,7 @@ runtimeConfig:
   "certificates.k8s.io/v1beta1": "true"
 networking:
   ipFamily: ${IP_FAMILY}
+  disableDefaultCNI: ${DISABLE_DEFAULT_CNI}
 # The install pulls ~570MB of third-party images (postgres, prometheus, the otel
 # collector, rustfs, envoy, jaeger) onto this one node. kubelet serializes image
 # pulls by default, so they queue behind one another and whichever workload draws
@@ -124,6 +138,10 @@ kubeadmConfigPatches:
   serializeImagePulls: false
   maxParallelImagePulls: 4
 EOF
+
+if [[ "${KIND_CONFIG_ONLY:-0}" == "1" ]]; then
+  exit 0
+fi
 
 echo "Deleting existing kind cluster '${KIND_CLUSTER_NAME}' if it exists..."
 "${ROOT}"/hack/kind.sh delete cluster --name "${KIND_CLUSTER_NAME}" || true
@@ -144,7 +162,11 @@ if [[ "${IP_FAMILY}" != "ipv4" &&
 fi
 
 echo "Creating kind cluster '${KIND_CLUSTER_NAME}'..."
-"${ROOT}"/hack/kind.sh create cluster --name "${KIND_CLUSTER_NAME}" --config "${ROOT}/bin/kind-config.yaml"
+kind_image_args=()
+if [[ -n "${KIND_NODE_IMAGE:-}" ]]; then
+  kind_image_args=(--image "${KIND_NODE_IMAGE}")
+fi
+"${ROOT}"/hack/kind.sh create cluster --name "${KIND_CLUSTER_NAME}" "${kind_image_args[@]}" --config "${ROOT}/bin/kind-config.yaml"
 
 # A daemon with IPv6 off hands kind a v4-only network whatever it asked for.
 if [[ "${IP_FAMILY}" != "ipv4" &&
