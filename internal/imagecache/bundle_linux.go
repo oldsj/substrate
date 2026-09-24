@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 
@@ -33,11 +34,11 @@ import (
 )
 
 // SetupBundleRootfs composes the bundle's rootfs from cached layers per the
-// bundle's overlay spec: it finalizes each layer (whiteout materialization,
-// once per layer node-wide), mounts an overlay at <bundle>/rootfs with the
-// cached layers as read-only lowerdirs and the bundle-local upper/ + work/
-// as the actor's private writable side, and creates the spec's ExtraDirs
-// through the mount (so they land in the upper).
+// bundle's overlay spec: it finalizes each layer, mounts an overlay at
+// <bundle>/rootfs with cached layers as read-only lowerdirs and the
+// bundle-local upper/ + work/ as the actor's private writable side. The
+// upper root receives the top layer's root metadata so the merged root matches
+// the image, and ExtraDirs are created through the mount (so they land in upper).
 //
 // A bundle without an overlay spec is left untouched (its rootfs is a plain
 // extracted directory). The mount lives in the calling process's mount
@@ -57,6 +58,10 @@ func SetupBundleRootfs(bundlePath string) error {
 			return fmt.Errorf("while finalizing layer %q: %w", layerDir, err)
 		}
 	}
+	rootMetadata, err := imageRootMetadata(spec.Layers)
+	if err != nil {
+		return fmt.Errorf("while resolving image root metadata: %w", err)
+	}
 
 	rootfs := filepath.Join(bundlePath, "rootfs")
 	upper := filepath.Join(bundlePath, "upper")
@@ -70,12 +75,22 @@ func SetupBundleRootfs(bundlePath string) error {
 	// Detach any stale mount left by a previous incarnation of this bundle
 	// path (e.g. a run that failed between mount and teardown). EINVAL just
 	// means nothing was mounted there.
-	_ = unix.Unmount(rootfs, unix.MNT_DETACH)
-
+	if err := unix.Unmount(rootfs, unix.MNT_DETACH); err != nil && !errors.Is(err, unix.EINVAL) && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("while detaching stale rootfs at %q: %w", rootfs, err)
+	}
 	if len(spec.Layers) == 0 {
 		// Degenerate zero-layer image: the empty rootfs dir plus ExtraDirs is
 		// all there is.
+		if err := applyDirectoryMetadata(rootfs, rootMetadata); err != nil {
+			return fmt.Errorf("while setting empty rootfs directory metadata: %w", err)
+		}
 		return createExtraDirs(rootfs, spec.ExtraDirs)
+	}
+	if err := applyDirectoryMetadata(upper, rootMetadata); err != nil {
+		return fmt.Errorf("while setting overlay upper root metadata: %w", err)
+	}
+	if err := applyDirectoryMetadata(work, directoryMetadata{Mode: 0o700}); err != nil {
+		return fmt.Errorf("while keeping overlay work directory private: %w", err)
 	}
 
 	if err := mountOverlay(rootfs, overlayLowerDirs(spec.Layers), upper, work); err != nil {
@@ -95,6 +110,13 @@ func SetupBundleRootfs(bundlePath string) error {
 	}
 	if err := applyDirFixups(rootfs, fixups); err != nil {
 		return fmt.Errorf("while repairing implicit dir metadata: %w", err)
+	}
+	owners, err := resolveOwnerFixups(spec.Layers)
+	if err != nil {
+		return fmt.Errorf("while resolving layer ownership: %w", err)
+	}
+	if err := applyOwnerFixups(rootfs, owners); err != nil {
+		return fmt.Errorf("while restoring layer ownership through rootfs: %w", err)
 	}
 
 	if err := setupImageVolumes(bundlePath, spec.ImageVolumes); err != nil {
@@ -228,24 +250,31 @@ func fsContextLog(fsfd int) string {
 	return " (kernel: " + strings.Join(msgs, "; ") + ")"
 }
 
-// FinalizeLayer materializes the whiteout state recorded at unpack time:
-// 0:0 char devices for whiteouts and trusted.overlay.opaque=y on opaque
-// dirs. This runs in ateom rather than atelet because mknod needs CAP_MKNOD
-// and trusted.* xattrs need CAP_SYS_ADMIN, both of which atelet deliberately
-// drops.
+// FinalizeLayer materializes the metadata recorded at unpack time: 0:0 char
+// devices for whiteouts and trusted.overlay.opaque=y on opaque dirs. Non-root
+// owners are applied through each bundle's mounted rootfs by SetupBundleRootfs,
+// so overlay copy-up keeps shared cache layers root-owned and removable by
+// capability-free atelet.
 //
 // Idempotent and safe under concurrent callers (multiple ateom pods share
 // the node's pool): EEXIST from mknod is success, setxattr is naturally
 // idempotent, and the marker is written last.
 func FinalizeLayer(layerDir string) error {
 	marker := filepath.Join(layerDir, layerFinalizedMarkerName)
-	if _, err := os.Stat(marker); err == nil {
-		return nil
-	}
-
 	wh, err := readWhiteouts(layerDir)
 	if err != nil {
 		return err
+	}
+	if wh.Version != whiteoutMetadataVersion {
+		return fmt.Errorf("layer %q has metadata version %d, want %d; clear the image cache to rebuild it", layerDir, wh.Version, whiteoutMetadataVersion)
+	}
+	for _, entry := range wh.Owners {
+		if _, err := validateOwnedPath(entry.Path); err != nil {
+			return fmt.Errorf("invalid ownership path: %w", err)
+		}
+	}
+	if _, err := os.Stat(marker); err == nil {
+		return nil
 	}
 
 	fsDir := filepath.Join(layerDir, layerFSDirName)
@@ -283,6 +312,65 @@ func FinalizeLayer(layerDir string) error {
 
 	if err := os.WriteFile(marker, nil, 0o600); err != nil {
 		return fmt.Errorf("while writing finalized marker: %w", err)
+	}
+	return nil
+}
+
+type directoryMetadata struct {
+	Mode os.FileMode
+	UID  int
+	GID  int
+}
+
+func imageRootMetadata(layers []string) (directoryMetadata, error) {
+	if len(layers) == 0 {
+		return directoryMetadata{Mode: 0o755}, nil
+	}
+	fsDir := filepath.Join(layers[len(layers)-1], layerFSDirName)
+	fi, err := os.Lstat(fsDir)
+	if err != nil {
+		return directoryMetadata{}, fmt.Errorf("while statting top layer root %q: %w", fsDir, err)
+	}
+	if !fi.IsDir() {
+		return directoryMetadata{}, fmt.Errorf("top layer root %q is not a directory", fsDir)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return directoryMetadata{}, fmt.Errorf("top layer root %q has no Unix ownership metadata", fsDir)
+	}
+	metadata := directoryMetadata{
+		Mode: fi.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky),
+		UID:  int(st.Uid),
+		GID:  int(st.Gid),
+	}
+	whiteouts, err := readWhiteouts(layers[len(layers)-1])
+	if err != nil {
+		return directoryMetadata{}, err
+	}
+	if whiteouts.Version != whiteoutMetadataVersion {
+		return directoryMetadata{}, fmt.Errorf("top layer %q has metadata version %d, want %d", layers[len(layers)-1], whiteouts.Version, whiteoutMetadataVersion)
+	}
+	for _, owner := range whiteouts.Owners {
+		rel, err := validateOwnedPath(owner.Path)
+		if err != nil {
+			return directoryMetadata{}, fmt.Errorf("invalid ownership path in top layer: %w", err)
+		}
+		if rel == "." {
+			if owner.UID != 0 || owner.GID != 0 {
+				metadata.UID, metadata.GID = owner.UID, owner.GID
+			}
+			metadata.Mode = fileModeFromTarBits(owner.Mode)
+		}
+	}
+	return metadata, nil
+}
+
+func applyDirectoryMetadata(path string, metadata directoryMetadata) error {
+	if err := os.Chown(path, metadata.UID, metadata.GID); err != nil {
+		return fmt.Errorf("while changing owner of %q to %d:%d: %w", path, metadata.UID, metadata.GID, err)
+	}
+	if err := os.Chmod(path, metadata.Mode); err != nil {
+		return fmt.Errorf("while changing mode of %q to %v: %w", path, metadata.Mode, err)
 	}
 	return nil
 }
@@ -328,7 +416,8 @@ func setOpaque(root *os.Root, rel string) error {
 // process's mount namespace. It is the teardown counterpart of
 // SetupBundleRootfs, keyed by directory rather than by container name so a
 // single call cleans up all of an actor's bundle mounts. Missing mounts are
-// not an error.
+// not an error. Once detached, the bundle-private rootfs/upper/work dirs are
+// restored to root-owned 0700 so atelet can clean them without capabilities.
 func UnmountAllUnder(dir string) error {
 	points, err := mountPointsUnder(dir)
 	if err != nil {
@@ -342,7 +431,83 @@ func UnmountAllUnder(dir string) error {
 			errs = append(errs, fmt.Errorf("while unmounting %q: %w", p, err))
 		}
 	}
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	bundles, err := bundleDirsUnder(dir)
+	if err != nil {
+		return err
+	}
+	private := directoryMetadata{Mode: 0o700}
+	for _, bundle := range bundles {
+		upper := filepath.Join(bundle, "upper")
+		if _, err := os.Lstat(upper); err == nil {
+			if err := resetUpperOwnership(upper); err != nil {
+				return fmt.Errorf("while restoring upper ownership at %q: %w", upper, err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("while checking bundle directory %q: %w", upper, err)
+		}
+		for _, name := range []string{"rootfs", "upper", "work"} {
+			path := filepath.Join(bundle, name)
+			if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+				continue
+			} else if err != nil {
+				return fmt.Errorf("while checking bundle directory %q: %w", path, err)
+			}
+			if err := applyDirectoryMetadata(path, private); err != nil {
+				return fmt.Errorf("while restoring private bundle directory %q: %w", path, err)
+			}
+		}
+	}
+	return nil
+}
+
+// resetUpperOwnership restores every copied-up owner before atelet removes the
+// bundle's upper. In particular, capability-free RemoveAllWritable cannot
+// chmod image-owned directories. WalkDir does not follow symlinks.
+func resetUpperOwnership(upper string) error {
+	return filepath.WalkDir(upper, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if err := os.Chown(path, 0, 0); err != nil {
+				return err
+			}
+			return os.Chmod(path, 0o700)
+		}
+		return os.Lchown(path, 0, 0)
+	})
+}
+
+func bundleDirsUnder(dir string) ([]string, error) {
+	if hasOverlaySpec(dir) {
+		return []string{dir}, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("while reading bundle directory %q: %w", dir, err)
+	}
+	var bundles []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		bundle := filepath.Join(dir, entry.Name())
+		if hasOverlaySpec(bundle) {
+			bundles = append(bundles, bundle)
+		}
+	}
+	return bundles, nil
+}
+
+func hasOverlaySpec(bundle string) bool {
+	fi, err := os.Lstat(filepath.Join(bundle, OverlaySpecFileName))
+	return err == nil && fi.Mode().IsRegular()
 }
 
 // mountPointsUnder lists mount points at or below dir per

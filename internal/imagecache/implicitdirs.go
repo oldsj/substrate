@@ -62,6 +62,7 @@ type dirFixup struct {
 // layers stay compatible.
 func resolveImplicitDirFixups(layers []string) ([]dirFixup, error) {
 	implicitAt := make([]map[string]bool, len(layers))
+	ownersAt := make([]map[string]ownedPath, len(layers))
 	union := map[string]bool{}
 	for i, layerDir := range layers {
 		meta, err := readWhiteouts(layerDir)
@@ -81,6 +82,17 @@ func resolveImplicitDirFixups(layers []string) ([]dirFixup, error) {
 			union[rel] = true
 		}
 		implicitAt[i] = set
+		owners := make(map[string]ownedPath, len(meta.Owners))
+		for _, owner := range meta.Owners {
+			rel, err := validateOwnedPath(owner.Path)
+			if err != nil {
+				return nil, fmt.Errorf("invalid ownership path in %q: %w", layerDir, err)
+			}
+			if owner.UID != 0 || owner.GID != 0 {
+				owners[rel] = owner
+			}
+		}
+		ownersAt[i] = owners
 	}
 	if len(union) == 0 {
 		return nil, nil
@@ -126,7 +138,10 @@ func resolveImplicitDirFixups(layers []string) ([]dirFixup, error) {
 				Path: p,
 				Mode: fi.Mode().Perm() | fi.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky),
 			}
-			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if owner, ok := ownersAt[j][p]; ok {
+				f.Mode = fileModeFromTarBits(owner.Mode)
+				f.UID, f.GID, f.HasOwner = owner.UID, owner.GID, true
+			} else if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 				f.UID, f.GID, f.HasOwner = int(st.Uid), int(st.Gid), true
 			}
 			fixups = append(fixups, f)

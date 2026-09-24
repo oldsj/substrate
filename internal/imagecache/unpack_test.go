@@ -20,6 +20,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -29,6 +30,8 @@ type tarEntry struct {
 	name     string
 	typeflag byte
 	mode     int64
+	uid      int
+	gid      int
 	body     string
 	linkname string
 }
@@ -57,6 +60,8 @@ func buildTar(t *testing.T, entries []tarEntry) []byte {
 			Name:     e.name,
 			Typeflag: e.typeflag,
 			Mode:     mode,
+			Uid:      e.uid,
+			Gid:      e.gid,
 			Size:     int64(len(e.body)),
 			Linkname: e.linkname,
 		}
@@ -90,6 +95,48 @@ func runUnpack(t *testing.T, entries []tarEntry) (string, *whiteoutSet, error) {
 	dir := t.TempDir()
 	wh, err := unpackInto(t, dir, buildTar(t, entries))
 	return dir, wh, err
+}
+
+func TestUnpackLayer_RecordsNonRootOwners(t *testing.T) {
+	entries := []tarEntry{
+		{name: ".", typeflag: tar.TypeDir, mode: 0o750, uid: 10001, gid: 10002},
+		{name: "work/", typeflag: tar.TypeDir, mode: 0o2750, uid: 10001, gid: 10002},
+		{name: "work/run", typeflag: tar.TypeReg, mode: 0o4751, uid: 10003, gid: 10004, body: "run"},
+		{name: "work/link", typeflag: tar.TypeSymlink, uid: 10005, gid: 10006, linkname: "run"},
+	}
+	dir, wh, err := runUnpack(t, entries)
+	if err != nil {
+		t.Fatalf("unpackLayer: %v", err)
+	}
+	want := []ownedPath{
+		{Path: ".", UID: 10001, GID: 10002, Mode: 0o750},
+		{Path: "work", UID: 10001, GID: 10002, Mode: 0o2750},
+		{Path: "work/link", UID: 10005, GID: 10006, Mode: 0o777},
+		{Path: "work/run", UID: 10003, GID: 10004, Mode: 0o4751},
+	}
+	if !reflect.DeepEqual(wh.Owners, want) {
+		t.Errorf("owners = %+v, want %+v", wh.Owners, want)
+	}
+	root, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Mode().Perm() != 0o750 {
+		t.Errorf("unpacked layer root mode = %v, want 0750", root.Mode().Perm())
+	}
+}
+
+func TestUnpackLayer_OwnerMetadataTracksLastEntry(t *testing.T) {
+	_, wh, err := runUnpack(t, []tarEntry{
+		{name: "f", typeflag: tar.TypeReg, uid: 10001, gid: 10002, body: "owned"},
+		{name: "f", typeflag: tar.TypeReg, body: "root-owned"},
+	})
+	if err != nil {
+		t.Fatalf("unpackLayer: %v", err)
+	}
+	if len(wh.Owners) != 0 {
+		t.Errorf("owners = %+v, want no stale owner metadata", wh.Owners)
+	}
 }
 
 func TestValidateTarName(t *testing.T) {

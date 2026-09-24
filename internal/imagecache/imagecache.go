@@ -21,14 +21,16 @@
 //
 //   - atelet (plain root, all capabilities dropped) pulls layers and unpacks
 //     them into the pool (Store.EnsureImage), and writes a rootfs-overlay.json
-//     next to each bundle's config.json (WriteSpec). Whiteout entries are
-//     recorded in per-layer metadata rather than materialized, because
-//     overlayfs whiteouts are char devices (CAP_MKNOD) with trusted.* xattrs
-//     for opaque dirs (CAP_SYS_ADMIN).
+//     next to each bundle's config.json (WriteSpec). Whiteouts and non-root
+//     owners are recorded in per-layer metadata rather than applied to the
+//     shared layer tree, because
+//     overlayfs whiteouts need CAP_MKNOD, opaque dirs need CAP_SYS_ADMIN,
+//     and non-root ownership needs CAP_CHOWN.
 //   - ateom (privileged; it already owns every mount on the node) finalizes
-//     layers — materializing the recorded whiteout state, once per layer —
-//     and mounts the overlay rootfs (SetupBundleRootfs) just before
-//     `runsc create` / staging the micro-VM virtio-fs lower.
+//     layers — materializing whiteouts and opaque dirs once per layer — and
+//     mounts the overlay rootfs (SetupBundleRootfs) just before `runsc create`
+//     / staging the micro-VM virtio-fs lower. Non-root ownership is applied
+//     through each bundle's mount so copy-up stays private to that bundle.
 //
 // On-disk layout under the cache root (a directory on the BasePath hostPath,
 // so the same absolute paths resolve in atelet and every ateom pod):
@@ -36,7 +38,7 @@
 //	version                          layout version marker
 //	layers/sha256/<diffid-hex>/
 //	    fs/                          the unpacked layer tree (overlay lowerdir)
-//	    whiteouts.json               whiteout state recorded at unpack time
+//	    whiteouts.json               unpack-time whiteout, implicit-dir, and owner state
 //	    finalized                    marker written by FinalizeLayer (ateom)
 //	manifests/sha256/<digest-hex>.json
 //	                                 image config + ordered diffID list
@@ -73,7 +75,7 @@ import (
 )
 
 const (
-	layoutVersion   = "1"
+	layoutVersion   = "2"
 	versionFileName = "version"
 
 	layerFSDirName           = "fs"

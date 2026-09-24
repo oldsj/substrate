@@ -43,7 +43,7 @@ privileged** and own all mounts on the node. The module is split accordingly:
 | Half | Runs in | Files | Needs |
 |---|---|---|---|
 | Store: pull, parse, unpack, record | atelet | `imagecache.go`, `unpack.go`, `spec.go` (portable) | nothing but file I/O |
-| Consumer: finalize, mount, unmount | ateom-gvisor / ateom-microvm | `bundle_linux.go` (`//go:build linux`) | `CAP_MKNOD`, `CAP_SYS_ADMIN` |
+| Consumer: finalize, mount, unmount | ateom-gvisor / ateom-microvm | `bundle_linux.go` (`//go:build linux`) | `CAP_MKNOD`, `CAP_SYS_ADMIN`, `CAP_CHOWN` |
 
 The two halves communicate through the filesystem only: the shared cache
 directory (on the `/var/lib/ateom-gvisor` hostPath, so the same absolute
@@ -58,10 +58,10 @@ anywhere.
 
 ```
 <cache-root>/                        default: /var/lib/ateom-gvisor/image-cache
-  version                            layout version marker ("1")
+  version                            layout version marker ("2")
   layers/sha256/<diffid-hex>/
       fs/                            the unpacked layer tree (an overlay lowerdir)
-      whiteouts.json                 whiteout state recorded at unpack time
+      whiteouts.json                 whiteout, implicit-dir, and owner metadata
       finalized                      marker written by FinalizeLayer (consumer side)
       size                           byte count recorded at unpack (lazily
                                      backfilled for older layers), so sizing
@@ -102,7 +102,10 @@ layer diffIDs in order — layers shared by N images exist once.
    layer tar omits (they may exist only in lower layers). Whiteout entries
    (`.wh.*`) are **not** written into the tree — overlayfs whiteouts are
    char devices atelet cannot create — they are recorded in
-   `whiteouts.json` for the consumer to materialize.
+   `whiteouts.json` for the consumer to materialize. Non-root uid/gid values
+   are recorded there too; atelet cannot apply them without `CAP_CHOWN`, and
+   applying them to shared cached layers would make capability-free GC unable
+   to remove image-owned directories safely.
 5. **Record**: the image config + diffID list is written under the
    requested digest (and the per-platform child digest for multi-arch refs).
 
@@ -119,15 +122,21 @@ staging the virtio-fs lower (micro-VM):
 
 1. **`FinalizeLayer`** for each referenced layer — materializes the recorded
    whiteouts as 0:0 char devices (`mknod`) and opaque dirs as
-   `trusted.overlay.opaque=y` xattrs. Once per layer node-wide; idempotent
-   and safe under concurrent ateom pods (`EEXIST` tolerated, marker written
-   last). Paths from `whiteouts.json` are re-validated, so a crafted file
-   cannot escape the layer tree.
+   `trusted.overlay.opaque=y` xattrs. It validates ownership paths but leaves
+   ownership in metadata so cached layers remain root-owned and removable by
+   atelet GC. Finalization is once per layer node-wide, idempotent and safe
+   under concurrent ateom pods (`EEXIST` tolerated, marker written last).
+   Paths from `whiteouts.json` are re-validated, so a crafted file cannot
+   escape the layer tree.
 2. **Mount** an overlay at `<bundle>/rootfs`: `lowerdir` is the layer chain
    reversed into overlayfs's top-first order (duplicate layers — images can
    legitimately list the same diffID twice — are collapsed to the topmost
    occurrence, which overlayfs otherwise rejects with `ELOOP`), `upperdir` /
    `workdir` are the bundle-local dirs, holding this actor's private writes.
+   The `upper/` root receives the top layer's `fs/` root mode and owner
+   metadata so the merged `/` matches the image; an empty image uses
+   `0755 root:root`.
+   `work/` stays `0700 root:root`.
    The mount uses the new mount API (`fsopen` + one `fsconfig` `lowerdir+`
    append per layer) rather than `mount(2)`, whose single-page option-string
    cap the digest-derived layer paths would hit at ~34 layers. **Minimum
@@ -148,6 +157,13 @@ staging the virtio-fs lower (micro-VM):
    is never modified. Residual gaps: directory mtimes and xattrs are not
    repaired, and a dir implicit in *every* layer of the chain keeps the
    fabricated attrs.
+5. **Non-root ownership fixups.** For visible entries whose uid/gid differs
+   from `0:0`, the consumer applies `lchown` through the mounted bundle rootfs
+   and restores mode bits that chown may clear. Overlayfs puts the metadata
+   changes in the bundle's private upper, leaving shared cache layers
+   root-owned. Chowning a regular file copies its full file data into that
+   bundle's upper, adding per-bundle disk use and copy-up I/O for large owned
+   files. Root-owned entries are skipped and do not copy up.
 
 A bundle without a spec file is left untouched (compatibility with bundles
 prepared by a pre-imagecache atelet). A zero-layer spec composes an empty
@@ -163,7 +179,17 @@ keeps building its own tmpfs upper, as before.
 **Teardown**: `UnmountAllUnder(bundleDir)` lazily detaches every mount below
 an actor's bundle directory (via `/proc/self/mountinfo`) before atelet wipes
 it — called from the checkpoint cleanup path in ateom-gvisor and
-`teardownActor` in ateom-microvm.
+`teardownActor` in ateom-microvm. After unmount, it resets owners throughout
+`upper/` (including copied-up files and symlinks), makes its directories
+`0700`, then restores `rootfs/`, `upper/`, and `work/` to `0700 root:root`.
+This lets capability-free atelet wipe them even when image entries or the
+image root belonged to non-root uids.
+
+The layout marker is version 2 because older cached layers have no owner
+metadata. An atelet using the new layout rejects a version 1 cache and requires
+the cache to be cleared and repopulated before actors can start. `FinalizeLayer`
+also checks each layer's metadata version before honoring its finalized marker,
+so missing or legacy metadata fails closed even if the cache marker is absent.
 
 ## Garbage collection
 
@@ -272,10 +298,11 @@ restructuring.
   rewriting, options. End-to-end pull tests run against an in-memory
   registry (`pkg/registry`).
 - Linux-tagged tests (`bundle_linux_test.go`): unprivileged ones cover
-  escape rejection and specless/zero-layer compose; root-gated ones execute
-  the real `mknod`/xattr materialization and a full mount → write-isolation
-  → unmount round trip (the write-isolation assertion — actor writes land in
-  the bundle upper, never in the shared pool — is the key safety property).
+  escape rejection, owner-fixup resolution and specless compose; root-gated
+  ones execute the real `mknod`/xattr materialization and a full mount →
+  write-isolation → owner-fixup → unmount round trip (including recursive
+  upper ownership reset; actor writes land in the bundle upper, never in the
+  shared pool).
   The root-gated ones self-skip via `roottest.Require`; CI (and
   `hack/run-root-tests.sh` locally) reruns the package under `sudo` so they
   execute.

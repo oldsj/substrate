@@ -318,6 +318,16 @@ func TestNew_RecoveryAndVersioning(t *testing.T) {
 	}
 }
 
+func TestNew_RejectsLegacyLayoutWithoutOwnerMetadata(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, versionFileName), []byte("1\n"), 0o600); err != nil {
+		t.Fatalf("writing legacy version marker: %v", err)
+	}
+	if _, err := New(root); err == nil {
+		t.Fatal("New accepted layout v1, whose cached layers lack owner metadata")
+	}
+}
+
 func TestIsLocalRegistry(t *testing.T) {
 	tests := []struct {
 		ref  string

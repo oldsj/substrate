@@ -29,6 +29,8 @@ import (
 )
 
 const (
+	whiteoutMetadataVersion = 2
+
 	// whiteoutPrefix marks an OCI layer entry that deletes the same-named
 	// path from lower layers.
 	whiteoutPrefix = ".wh."
@@ -38,8 +40,8 @@ const (
 )
 
 // whiteoutSet records per-layer metadata captured at unpack time that the
-// (privileged) consumer needs at compose time: whiteout state materialized
-// by FinalizeLayer, and the directories this layer only created implicitly.
+// (privileged) consumer needs at compose time: whiteout state materialized by
+// FinalizeLayer, implicit directories, and non-root ownership entries.
 // Paths are clean and relative to the layer's fs/ root.
 type whiteoutSet struct {
 	Version int `json:"version"`
@@ -55,12 +57,54 @@ type whiteoutSet struct {
 	// attrs a lower layer declared (e.g. /tmp's 1777). SetupBundleRootfs
 	// repairs the merged view from these records (see resolveImplicitDirFixups).
 	ImplicitDirs []string `json:"implicitDirs,omitempty"`
+	// Owners records non-root owners that atelet cannot apply without
+	// CAP_CHOWN. SetupBundleRootfs applies them through the bundle overlay,
+	// keeping the shared cached layer tree root-owned.
+	Owners []ownedPath `json:"owners,omitempty"`
+}
+
+// ownedPath is a path whose image owner is not root. Mode uses Unix's 0o7777
+// permission and special-bit representation so the overlay copy-up can restore
+// it after chown clears setuid/setgid bits.
+type ownedPath struct {
+	Path string `json:"path"`
+	UID  int    `json:"uid"`
+	GID  int    `json:"gid"`
+	Mode uint32 `json:"mode"`
+}
+
+func tarModeBits(mode os.FileMode) uint32 {
+	bits := uint32(mode.Perm())
+	if mode&os.ModeSetuid != 0 {
+		bits |= 0o4000
+	}
+	if mode&os.ModeSetgid != 0 {
+		bits |= 0o2000
+	}
+	if mode&os.ModeSticky != 0 {
+		bits |= 0o1000
+	}
+	return bits
+}
+
+func fileModeFromTarBits(bits uint32) os.FileMode {
+	mode := os.FileMode(bits & 0o777)
+	if bits&0o4000 != 0 {
+		mode |= os.ModeSetuid
+	}
+	if bits&0o2000 != 0 {
+		mode |= os.ModeSetgid
+	}
+	if bits&0o1000 != 0 {
+		mode |= os.ModeSticky
+	}
+	return mode
 }
 
 func readWhiteouts(layerDir string) (*whiteoutSet, error) {
 	b, err := os.ReadFile(filepath.Join(layerDir, layerWhiteoutsFileName))
 	if errors.Is(err, os.ErrNotExist) {
-		return &whiteoutSet{Version: 1}, nil
+		return &whiteoutSet{}, nil
 	} else if err != nil {
 		return nil, fmt.Errorf("while reading layer whiteouts: %w", err)
 	}
@@ -89,6 +133,20 @@ func validateTarName(name string) (cleaned string, skip bool, err error) {
 	return cleaned, false, nil
 }
 
+func validateOwnedPath(name string) (string, error) {
+	if name == "." {
+		return name, nil
+	}
+	rel, skip, err := validateTarName(name)
+	if err != nil {
+		return "", err
+	}
+	if skip {
+		return "", fmt.Errorf("empty path")
+	}
+	return rel, nil
+}
+
 // unpackLayer extracts one uncompressed OCI layer tar into root. Whiteout
 // entries (.wh.*) are not written to the tree; they are returned so the
 // caller can persist them for later materialization by a privileged process.
@@ -98,7 +156,7 @@ func validateTarName(name string) (cleaned string, skip bool, err error) {
 // duplicate entries within a single layer (real ko images repeat directory
 // entries).
 func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteoutSet, error) {
-	wh := &whiteoutSet{Version: 1}
+	wh := &whiteoutSet{Version: whiteoutMetadataVersion}
 
 	// Directories are created owner-writable during extraction (so their children
 	// can be written even when the image marks them read-only, e.g. ko ships
@@ -114,6 +172,21 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 	// fabricated attrs.
 	declared := map[string]bool{}
 	implicit := map[string]bool{}
+	owners := map[string]ownedPath{}
+	setOwner := func(name string, uid, gid int, mode os.FileMode) {
+		if uid == 0 && gid == 0 {
+			delete(owners, name)
+			return
+		}
+		owners[name] = ownedPath{Path: name, UID: uid, GID: gid, Mode: tarModeBits(mode)}
+	}
+	clearOwners := func(name string) {
+		for p := range owners {
+			if p == name || strings.HasPrefix(p, name+string(filepath.Separator)) {
+				delete(owners, p)
+			}
+		}
+	}
 	markAncestors := func(name string) {
 		for p := filepath.Dir(name); p != "."; p = filepath.Dir(p) {
 			if !declared[p] {
@@ -136,6 +209,16 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 			return nil, fmt.Errorf("invalid tar entry: %w", err)
 		}
 		if skip {
+			// A tar can declare metadata for the layer root as ".". The fs/
+			// directory is created by atelet, so retain non-root ownership in
+			// metadata for SetupBundleRootfs to apply to the bundle's upper.
+			if hdr.Typeflag == tar.TypeDir && isRootTarName(hdr.Name) {
+				mode := hdr.FileInfo().Mode()
+				dirModes["."] = fileModeFromTarBits(tarModeBits(mode))
+				declared["."] = true
+				delete(implicit, ".")
+				setOwner(".", hdr.Uid, hdr.Gid, mode)
+			}
 			continue
 		}
 
@@ -155,7 +238,7 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 			continue
 		}
 
-		mode := hdr.FileInfo().Mode().Perm()
+		mode := hdr.FileInfo().Mode()
 
 		// A layer tar routinely omits entries for parent directories that
 		// exist in lower layers (e.g. just "etc/nsswitch.conf", with "etc/"
@@ -180,12 +263,13 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 				if err := root.RemoveAll(name); err != nil {
 					return nil, fmt.Errorf("while replacing existing path at %q before regular file: %w", name, err)
 				}
+				clearOwners(name)
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("while checking existing path at %q before regular file: %w", name, err)
 			}
 
 			// Stream directly from tarReader to target file to avoid buffering in memory.
-			outFile, err := root.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_TRUNC, mode)
+			outFile, err := root.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_TRUNC, mode.Perm())
 			if err != nil {
 				return nil, fmt.Errorf("while creating file %q: %w", name, err)
 			}
@@ -199,12 +283,13 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 			if closeErr != nil {
 				return nil, fmt.Errorf("while closing file %q: %w", name, closeErr)
 			}
+			setOwner(name, hdr.Uid, hdr.Gid, mode)
 
 		case tar.TypeDir:
 			// Create owner-writable so children can be written even when the image
 			// marks the dir read-only; the real mode is restored after extraction
 			// (see dirModes / the restore pass below).
-			err := root.Mkdir(name, mode|0o700)
+			err := root.Mkdir(name, mode.Perm()|0o700)
 			if errors.Is(err, os.ErrExist) {
 				// OCI layers can repeat a directory entry (real ko images do); the
 				// existing dir is already owner-writable, so let the later entry's
@@ -212,9 +297,10 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 			} else if err != nil {
 				return nil, fmt.Errorf("while creating directory=%q, mode=%v: %w", name, mode, err)
 			}
-			dirModes[name] = mode
+			dirModes[name] = fileModeFromTarBits(tarModeBits(mode))
 			declared[name] = true
 			delete(implicit, name)
+			setOwner(name, hdr.Uid, hdr.Gid, mode)
 
 		case tar.TypeSymlink:
 			// A layer may re-define the same path (e.g. declare /var/run as a dir
@@ -224,6 +310,7 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 				// If it's already the same symlink, skip the unlink+symlink pair.
 				if existing.Mode()&os.ModeSymlink != 0 {
 					if cur, rerr := root.Readlink(name); rerr == nil && cur == hdr.Linkname {
+						setOwner(name, hdr.Uid, hdr.Gid, mode)
 						continue
 					}
 				}
@@ -234,12 +321,14 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 				if err := root.RemoveAll(name); err != nil {
 					return nil, fmt.Errorf("while replacing existing path at %q before symlink: %w", name, err)
 				}
+				clearOwners(name)
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("while checking existing path at %q before symlink: %w", name, err)
 			}
 			if err := root.Symlink(hdr.Linkname, name); err != nil {
 				return nil, fmt.Errorf("while creating symlink src=%q target=%q: %w", name, hdr.Linkname, err)
 			}
+			setOwner(name, hdr.Uid, hdr.Gid, mode)
 
 		case tar.TypeLink:
 			linkname, linkSkip, err := validateTarName(hdr.Linkname)
@@ -254,12 +343,18 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 				if err := root.RemoveAll(name); err != nil {
 					return nil, fmt.Errorf("while replacing existing path at %q before hardlink: %w", name, err)
 				}
+				clearOwners(name)
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("while checking existing path at %q before hardlink: %w", name, err)
 			}
 			if err := root.Link(linkname, name); err != nil {
 				return nil, fmt.Errorf("while creating hardlink src=%q target=%q: %w", name, linkname, err)
 			}
+			fi, err := root.Lstat(name)
+			if err != nil {
+				return nil, fmt.Errorf("while statting hardlink %q: %w", name, err)
+			}
+			setOwner(name, hdr.Uid, hdr.Gid, fi.Mode())
 
 		default:
 			tfStr := string([]byte{hdr.Typeflag})
@@ -277,7 +372,15 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 	for name := range dirModes {
 		dirs = append(dirs, name)
 	}
-	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+	sort.Slice(dirs, func(i, j int) bool {
+		if dirs[i] == "." {
+			return false
+		}
+		if dirs[j] == "." {
+			return true
+		}
+		return len(dirs[i]) > len(dirs[j])
+	})
 	for _, name := range dirs {
 		if err := root.Chmod(name, dirModes[name]); err != nil {
 			return nil, fmt.Errorf("while restoring mode %v on directory %q: %w", dirModes[name], name, err)
@@ -310,6 +413,18 @@ func unpackLayer(ctx context.Context, tarData io.Reader, root *os.Root) (*whiteo
 		}
 	}
 	sort.Strings(wh.ImplicitDirs)
+	ownerNames := make([]string, 0, len(owners))
+	for name := range owners {
+		ownerNames = append(ownerNames, name)
+	}
+	sort.Strings(ownerNames)
+	for _, name := range ownerNames {
+		wh.Owners = append(wh.Owners, owners[name])
+	}
 
 	return wh, nil
+}
+
+func isRootTarName(name string) bool {
+	return name != "" && filepath.Clean(strings.TrimPrefix(name, "/")) == "."
 }

@@ -21,7 +21,7 @@ A fork of [Agent Substrate](https://github.com/agent-substrate/substrate).
 |---|---|
 | `hack/create-kind-cluster.sh`: opt-in `DISABLE_DEFAULT_CNI`, `KIND_NODE_IMAGE`, `KIND_CONFIG_ONLY` | Not staged |
 | atelet: run actor containers as the image's `USER` in its `WORKDIR` | `upstream/image-user-workdir` |
-| atelet/ateom: preserve image root metadata and non-root layer owners | Not staged |
+| atelet/ateom: preserve image root metadata and non-root layer ownership (regular-file ownership fixups copy file data into each bundle's upper) | Not staged |
 | atelet/ateom: assign fresh durable volumes to the first rw non-root image user and preserve restored owners | Not staged |
 
 ## Updating
