@@ -135,6 +135,28 @@ func TestBuild_Capabilities(t *testing.T) {
 	}
 }
 
+// Without a resolved identity or working directory the process is root in /.
+func TestBuild_DefaultUserAndCwd(t *testing.T) {
+	spec := Build(Options{ActorUID: testActorUID, ContainerName: "app", Args: []string{"/app"}})
+	if got := spec.Process.User; got.UID != 0 || got.GID != 0 {
+		t.Errorf("User = %+v, want 0:0", got)
+	}
+	if got := spec.Process.Cwd; got != "/" {
+		t.Errorf("Cwd = %q, want /", got)
+	}
+}
+
+// The resolved image user and working directory land on the process.
+func TestBuild_UserAndCwd(t *testing.T) {
+	spec := Build(Options{ActorUID: testActorUID, ContainerName: "app", Args: []string{"/app"}, UID: 10001, GID: 10002, Cwd: "/work/repo"})
+	if got := spec.Process.User; got.UID != 10001 || got.GID != 10002 {
+		t.Errorf("User = %+v, want 10001:10002", got)
+	}
+	if got := spec.Process.Cwd; got != "/work/repo" {
+		t.Errorf("Cwd = %q, want /work/repo", got)
+	}
+}
+
 // The pause container gets no capabilities.
 func TestBuild_NoCapabilitiesForPause(t *testing.T) {
 	spec := Build(Options{ActorUID: testActorUID, ContainerName: PauseContainer, Args: []string{"/pause"}})

@@ -33,13 +33,18 @@ const specFile = "config.json"
 // hostname is the UTS hostname for actor containers.
 const hostname = "actor"
 
-// Options describes one actor container. Args, Env and Capabilities arrive
-// already resolved.
+// Options describes one actor container. Args, Env, UID/GID, Cwd and
+// Capabilities arrive already resolved.
 type Options struct {
 	ActorUID      string
 	ContainerName string
 	Args          []string
 	Env           []string
+	// UID and GID are the process identity; zero is root.
+	UID uint32
+	GID uint32
+	// Cwd is the process working directory; empty means "/".
+	Cwd string
 	// NetNSPath is the network namespace the ateom runs the actor in.
 	NetNSPath    string
 	Volumes      []*ateletpb.Volume
@@ -81,15 +86,19 @@ func ociResources(r *ateletpb.ResourceLimits) *specs.LinuxResources {
 
 // Build returns a runtime-neutral OCI spec for an actor container.
 func Build(o Options) *specs.Spec {
+	cwd := o.Cwd
+	if cwd == "" {
+		cwd = "/"
+	}
 	spec := &specs.Spec{
 		Process: &specs.Process{
 			User: specs.User{
-				UID: 0,
-				GID: 0,
+				UID: o.UID,
+				GID: o.GID,
 			},
 			Args: o.Args,
 			Env:  o.Env,
-			Cwd:  "/",
+			Cwd:  cwd,
 			Capabilities: &specs.LinuxCapabilities{
 				Bounding:  o.Capabilities,
 				Effective: o.Capabilities,
