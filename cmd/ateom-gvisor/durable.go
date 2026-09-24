@@ -78,3 +78,13 @@ func untarDurableVolumes(dir, snapshotDir string) error {
 	})
 	return nil
 }
+
+// clearDurableDirVolumes removes ateom's local copy after the actor is gone.
+// A checkpoint tar preserves the volume data and owners; leaving the chowned
+// tree behind would prevent capability-free atelet from resetting actor dirs.
+func clearDurableDirVolumes(actorUID string) error {
+	if err := os.RemoveAll(ateompath.DurableDirVolumeMountsDir(actorUID)); err != nil {
+		return fmt.Errorf("while clearing local durable-dir volumes: %w", err)
+	}
+	return nil
+}

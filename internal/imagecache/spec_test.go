@@ -26,8 +26,9 @@ import (
 func TestOverlaySpecRoundTrip(t *testing.T) {
 	bundle := t.TempDir()
 	in := &OverlaySpec{
-		Layers:    []string{"/cache/layers/sha256/aaa", "/cache/layers/sha256/bbb"},
-		ExtraDirs: []string{"/run/ate"},
+		Layers:           []string{"/cache/layers/sha256/aaa", "/cache/layers/sha256/bbb"},
+		ExtraDirs:        []string{"/run/ate"},
+		DurableDirOwners: []DurableDirOwner{{Name: "data", UID: 10001, GID: 10002}},
 	}
 	if err := WriteSpec(bundle, in); err != nil {
 		t.Fatalf("WriteSpec: %v", err)
@@ -45,6 +46,9 @@ func TestOverlaySpecRoundTrip(t *testing.T) {
 	}
 	if !slices.Equal(out.ExtraDirs, in.ExtraDirs) {
 		t.Errorf("ExtraDirs = %v, want %v", out.ExtraDirs, in.ExtraDirs)
+	}
+	if !slices.Equal(out.DurableDirOwners, in.DurableDirOwners) {
+		t.Errorf("DurableDirOwners = %v, want %v", out.DurableDirOwners, in.DurableDirOwners)
 	}
 }
 

@@ -640,28 +640,24 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 		size:           sizing.FromLimits(req.GetCpuMilli(), req.GetMemoryBytes()),
 		durableVolumes: durableVolumeNames(req.GetSpec()),
 	}
-	var containersToDelete []string
 	defer func() {
 		if retErr != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
-			if err := s.deactivateActorNetworking(cleanupCtx, ateomstats.ActorAttributionFromRequest(req)); err != nil {
-				slog.WarnContext(cleanupCtx, "Failed to deactivate actor networking after Run failure", slog.Any("err", err))
-			}
-			deleteContainers(cleanupCtx, rcmd, containersToDelete, "Run")
-			// Detach any bundle rootfs overlays a partially-completed setup
-			// mounted, mirroring the post-checkpoint cleanup — otherwise they
-			// linger in this namespace until atelet wipes the bundle dirs.
-			// Run before the network cleanup.
-			if err := imagecache.UnmountAllUnder(ateompath.OCIBundleDir(req.GetActorUid())); err != nil {
-				slog.WarnContext(ctx, "Failed to unmount bundle rootfs overlays after Run failure",
-					"actorUID", req.GetActorUid(), "err", err)
-			}
-			if err := s.unhostActor(cleanupCtx, req.GetActorUid()); err != nil {
-				slog.WarnContext(cleanupCtx, "Failed to clean up actor network after Run failure", slog.Any("err", err))
+			if err := s.terminateWorkload(cleanupCtx, attribution.Ref, req.GetActorUid(), req.GetRunscPath(), req.GetSpec().GetContainers()); err != nil {
+				slog.WarnContext(cleanupCtx, "Failed to clean up after Run failure", slog.Any("err", err))
 			}
 		}
 	}()
+	// This is a fresh Run: initialize the durable volume directories before
+	// any workload container starts. Restore untars their archived owners
+	// first and deliberately does not call this initializer.
+	if err := imagecache.ApplyInitialDurableDirOwners(
+		req.GetActorUid(),
+		containerNames(req.GetSpec().GetContainers()),
+	); err != nil {
+		return nil, fmt.Errorf("while initializing durable-dir volume owners: %w", err)
+	}
 	// Create and start pause container. The bundle rootfs is composed here —
 	// an overlay of the node's cached image layers plus the bundle's private
 	// upper — because mounting is ateom's job (atelet runs with no
@@ -670,7 +666,6 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	if err := imagecache.SetupBundleRootfs(ateompath.OCIBundlePath(req.GetActorUid(), ocispec.PauseContainer)); err != nil {
 		return nil, fmt.Errorf("while composing pause rootfs: %w", err)
 	}
-	containersToDelete = append(containersToDelete, ocispec.PauseContainer)
 	if err := rcmd.cmdCreate(ctx, os.Stdout, ocispec.PauseContainer, nil); err != nil {
 		return nil, fmt.Errorf("while creating pause container: %w", err)
 	}
@@ -689,7 +684,6 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 		if err := imagecache.SetupBundleRootfs(ateompath.OCIBundlePath(req.GetActorUid(), ac.GetName())); err != nil {
 			return nil, fmt.Errorf("while composing %q rootfs: %w", ac.GetName(), err)
 		}
-		containersToDelete = append(containersToDelete, ac.GetName())
 		if err := rcmd.cmdCreate(ctx, pw, ac.GetName(), nil); err != nil {
 			return nil, fmt.Errorf("while creating %q application container: %w", ac.GetName(), err)
 		}
@@ -920,22 +914,12 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		size:           sizing.FromLimits(req.GetCpuMilli(), req.GetMemoryBytes()),
 		durableVolumes: durableVolumeNames(req.GetSpec()),
 	}
-	var containersToDelete []string
 	defer func() {
 		if retErr != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
-			if err := s.deactivateActorNetworking(cleanupCtx, ateomstats.ActorAttributionFromRequest(req)); err != nil {
-				slog.WarnContext(cleanupCtx, "Failed to deactivate actor networking after Restore failure", slog.Any("err", err))
-			}
-			deleteContainers(cleanupCtx, rcmd, containersToDelete, "Restore")
-			// Same overlay detach as the Run-failure path above.
-			if err := imagecache.UnmountAllUnder(ateompath.OCIBundleDir(req.GetActorUid())); err != nil {
-				slog.WarnContext(ctx, "Failed to unmount bundle rootfs overlays after Restore failure",
-					"actorUID", req.GetActorUid(), "err", err)
-			}
-			if err := s.unhostActor(cleanupCtx, req.GetActorUid()); err != nil {
-				slog.WarnContext(cleanupCtx, "Failed to clean up actor network after Restore failure", slog.Any("err", err))
+			if err := s.terminateWorkload(cleanupCtx, attribution.Ref, req.GetActorUid(), req.GetRunscPath(), req.GetSpec().GetContainers()); err != nil {
+				slog.WarnContext(cleanupCtx, "Failed to clean up after Restore failure", slog.Any("err", err))
 			}
 		}
 	}()
@@ -946,6 +930,8 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 			return nil, fmt.Errorf("while restoring durable-dir volumes: %w", err)
 		}
 	}
+	// Restore specs omit DurableDirOwners. The tar restored the volume
+	// directory owners above, including an empty volume root's owner.
 	// Compose the pause rootfs before create (see RunWorkload). runsc restore
 	// only needs the rootfs to hold the correct content; whether it came from
 	// an untar or an overlay of cached layers is transparent to it.
@@ -956,7 +942,6 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	switch req.GetScope() {
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
 		// Create and start pause container (cold boot with durable-dir volumes restored)
-		containersToDelete = append(containersToDelete, ocispec.PauseContainer)
 		if err := rcmd.cmdCreate(ctx, os.Stdout, ocispec.PauseContainer, nil); err != nil {
 			return nil, fmt.Errorf("while creating pause container: %w", err)
 		}
@@ -965,7 +950,6 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		}
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL, ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA_ON_GOLDEN:
 		// Create and restore pause container
-		containersToDelete = append(containersToDelete, ocispec.PauseContainer)
 		if err := rcmd.cmdCreate(ctx, os.Stdout, ocispec.PauseContainer, nil); err != nil {
 			return nil, fmt.Errorf("while creating pause container: %w", err)
 		}
@@ -989,7 +973,6 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		}
 		switch req.GetScope() {
 		case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
-			containersToDelete = append(containersToDelete, ac.GetName())
 			if err := rcmd.cmdCreate(ctx, pw, ac.GetName(), nil); err != nil {
 				return nil, fmt.Errorf("while creating %q application container: %w", ac.GetName(), err)
 			}
@@ -997,7 +980,6 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 				return nil, fmt.Errorf("while starting %q application container: %w", ac.GetName(), err)
 			}
 		case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL, ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA_ON_GOLDEN:
-			containersToDelete = append(containersToDelete, ac.GetName())
 			if err := rcmd.cmdCreate(ctx, pw, ac.GetName(), nil); err != nil {
 				return nil, fmt.Errorf("while creating %q application container: %w", ac.GetName(), err)
 			}
@@ -1111,8 +1093,10 @@ func (s *AteomService) terminateWorkload(ctx context.Context, actorRef resources
 	// Keep this as best-effort cleanup:
 	// atelet resets the actor runsc, bundle, pidfile, and checkpoint
 	// directories after uploading the snapshot.
+	cleanupSafe := true
 	if err := cleanupContainers(cleanupCtx, rcmd, containers); err != nil {
 		errs = append(errs, fmt.Errorf("while cleaning up runsc containers: %w", err))
+		cleanupSafe = false
 	}
 
 	// Detach the overlay rootfs mounts before atelet wipes the bundle dirs
@@ -1121,6 +1105,12 @@ func (s *AteomService) terminateWorkload(ctx context.Context, actorRef resources
 	// the container cleanup above.
 	if err := imagecache.UnmountAllUnder(ateompath.OCIBundleDir(actorUID)); err != nil {
 		errs = append(errs, fmt.Errorf("while unmounting bundle rootfs overlays: %w", err))
+		cleanupSafe = false
+	}
+	if hasDurableVolumes(containers) && cleanupSafe {
+		if err := clearDurableDirVolumes(actorUID); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	if err := s.unhostActor(ctx, actorUID); err != nil {

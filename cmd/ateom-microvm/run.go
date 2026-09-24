@@ -278,6 +278,16 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 		}
 	}()
 
+	// Run starts from atelet's fresh, empty durable directories. Restores
+	// untar those directories before boot and must keep the tarred ownership.
+	containerNames := make([]string, 0, len(p.containers))
+	for _, container := range p.containers {
+		containerNames = append(containerNames, container.GetName())
+	}
+	if err := imagecache.ApplyInitialDurableDirOwners(p.actorUID, containerNames); err != nil {
+		return nil, fmt.Errorf("while initializing durable-dir volume owners: %w", err)
+	}
+
 	if err := s.coldBootActorRetrying(ctx, p); err != nil {
 		return nil, err
 	}

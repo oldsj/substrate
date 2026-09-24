@@ -145,6 +145,8 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 			return nil, err
 		}
 	}
+	// Keep the owner tarutil restored for each durable volume, including the
+	// volume directory itself. Restore never applies fresh-run owner metadata.
 
 	switch scope := req.GetScope(); scope {
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL,

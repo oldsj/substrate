@@ -19,9 +19,11 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
+	"github.com/agent-substrate/substrate/internal/roottest"
 )
 
 func TestHasDurableVolumes(t *testing.T) {
@@ -105,5 +107,38 @@ func TestDurableVolumesRoundTrip(t *testing.T) {
 		if string(got) != want {
 			t.Errorf("restored %q content = %q, want %q", vol, got, want)
 		}
+	}
+}
+
+func TestDurableVolumesRoundTripRestoresVolumeRootOwner(t *testing.T) {
+	roottest.Require(t, "restoring durable volume directory ownership requires CAP_CHOWN")
+
+	const uid, gid = 1234, 5678
+	src := durableDirWith(t, []string{"data"}, false)
+	if err := os.Chown(filepath.Join(src, "data"), uid, gid); err != nil {
+		t.Fatalf("chowning source volume directory: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(src, "data"), 0o755); err != nil {
+		t.Fatalf("making source volume directory traversable for the tar walk: %v", err)
+	}
+	checkpointDir := t.TempDir()
+	if err := tarDurableVolumes(t.Context(), src, checkpointDir); err != nil {
+		t.Fatalf("tarDurableVolumes: %v", err)
+	}
+
+	dst := t.TempDir()
+	if err := untarDurableVolumes(dst, checkpointDir); err != nil {
+		t.Fatalf("untarDurableVolumes: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dst, "data"))
+	if err != nil {
+		t.Fatalf("stating restored volume directory: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("restored volume directory has no syscall.Stat_t")
+	}
+	if stat.Uid != uid || stat.Gid != gid {
+		t.Errorf("restored volume directory owner = %d:%d, want %d:%d", stat.Uid, stat.Gid, uid, gid)
 	}
 }

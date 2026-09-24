@@ -58,6 +58,19 @@ type OverlaySpec struct {
 	// each at the volume's bundle-local mount point, which the OCI spec binds
 	// into the container.
 	ImageVolumes []ImageVolumeOverlay `json:"imageVolumes,omitempty"`
+	// DurableDirOwners are volumes whose fresh, empty host directories ateom
+	// initializes for this container. atelet assigns each durable volume to the
+	// first rw, non-root mount in container spec order. Restore specs omit these:
+	// durable snapshots carry the volume directory's own archived owner.
+	DurableDirOwners []DurableDirOwner `json:"durableDirOwners,omitempty"`
+}
+
+// DurableDirOwner is the image process identity that owns a fresh durable-dir
+// volume before the first container starts.
+type DurableDirOwner struct {
+	Name string `json:"name"`
+	UID  uint32 `json:"uid"`
+	GID  uint32 `json:"gid"`
 }
 
 // ImageVolumeOverlay is one image volume's contents.

@@ -351,6 +351,11 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, ra *running
 			errs = append(errs, fmt.Errorf("while unmounting bundle rootfs overlays: %w", err))
 		}
 	}
+	// After teardown the guest is gone. Checkpointed durable data is already
+	// in the tar, and atelet cannot traverse a non-root-owned local tree.
+	if err := os.RemoveAll(ateompath.DurableDirVolumeMountsDir(id)); err != nil {
+		errs = append(errs, fmt.Errorf("while clearing local durable-dir volumes: %w", err))
+	}
 	return errors.Join(errs...)
 }
 
