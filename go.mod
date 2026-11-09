@@ -33,7 +33,7 @@ require (
 	github.com/klauspost/compress v1.19.1
 	github.com/myzhan/boomer v1.6.1-0.20250711115830-8a2c7ce4c7b1
 	github.com/opencontainers/runtime-spec v1.3.0
-	github.com/openfga/api/proto v0.0.0-20260319214821-f153694bfc20
+	github.com/openfga/api/proto v0.0.0-20260928071936-c0650ce2169b
 	github.com/openfga/language/pkg/go v0.3.2-0.20260730144454-83fedf8a4e70
 	github.com/openfga/openfga v1.20.0
 	github.com/pressly/goose/v3 v3.27.3
