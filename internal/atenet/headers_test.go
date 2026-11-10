@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,6 +31,8 @@ func TestParseTargetActor(t *testing.T) {
 		{name: "empty actor", value: "team-a/", wantErr: true},
 		{name: "invalid atespace", value: "TEAM-A/actor-1", wantErr: true},
 		{name: "invalid actor", value: "team-a/ACTOR-1", wantErr: true},
+		{name: "comma-joined actors", value: "demo/a,secret/x", wantErr: true},
+		{name: "comma-separated with space", value: "demo/a, demo/b", wantErr: true},
 	}
 
 	for _, tt := range tests {

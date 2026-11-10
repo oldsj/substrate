@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/ateattr"
 )
 
 // Handler applies one direction's policy to a request. Implementations live in

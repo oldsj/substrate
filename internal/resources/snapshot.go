@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,6 +51,20 @@ type StoragePrefix struct {
 func (p StoragePrefix) IsZero() bool { return p == StoragePrefix{} }
 
 func (p StoragePrefix) String() string { return p.uri }
+
+// ParseStoragePrefix parses a storage prefix received as a string, such as a
+// snapshot URI or an owner's prefix. It rejects a bare bucket, so a prefix
+// can never name every object in a bucket.
+func ParseStoragePrefix(uri string) (StoragePrefix, error) {
+	u, err := parseStorageURI(uri)
+	if err != nil {
+		return StoragePrefix{}, fmt.Errorf("invalid storage prefix %q: %w", uri, err)
+	}
+	if strings.Trim(u.Path, "/") == "" {
+		return StoragePrefix{}, fmt.Errorf("invalid storage prefix %q: missing path", uri)
+	}
+	return StoragePrefix{uri: uri}, nil
+}
 
 // SnapshotOwner is the resource whose objects a snapshot's prefix holds: the
 // Actor that took it, or the Tag that copied it. Deletion is expressed as
@@ -108,8 +122,8 @@ func (o SnapshotOwner) Prefix(location string) (StoragePrefix, error) {
 	if err := o.validate(); err != nil {
 		return StoragePrefix{}, err
 	}
-	if err := ValidateSnapshotLocation(location); err != nil {
-		return StoragePrefix{}, err
+	if _, err := parseStorageURI(location); err != nil {
+		return StoragePrefix{}, fmt.Errorf("invalid snapshot location %q: %w", location, err)
 	}
 	uri, err := url.JoinPath(location, atespacesPathSegment, o.atespace, o.kind, o.id)
 	if err != nil {

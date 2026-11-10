@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,19 +39,21 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	"github.com/agent-substrate/substrate/internal/credbundle"
-	"github.com/agent-substrate/substrate/internal/installdefaults"
-	"github.com/agent-substrate/substrate/internal/serverboot"
-	"github.com/agent-substrate/substrate/internal/version"
-	"github.com/agent-substrate/substrate/pkg/proto/credproviderpb"
+	"go.ate.dev/substrate/api/credprovider/v1"
+	"go.ate.dev/substrate/internal/credbundle"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/preview"
+	"go.ate.dev/substrate/internal/serverboot"
+	"go.ate.dev/substrate/internal/version"
 )
 
 const serviceName = "credprovider"
 
 var (
 	listenAddr   = pflag.String("listen-address", ":50051", "gRPC listen address")
-	metricsAddr  = pflag.String("metrics-address", ":9090", "Prometheus/health HTTP listen address")
-	statusAddr   = pflag.String("status-address", ":4040", "/statusz HTTP listen address; empty disables the page")
+	metricsAddr  = pflag.String("metrics-address", ":9090", "Prometheus /metrics HTTP listen address")
+	healthAddr   = pflag.String("health-address", ":9091", "/readyz and /healthz HTTP listen address")
+	statusAddr   = pflag.String("status-address", "127.0.0.1:4040", "/statusz HTTP listen address; defaults to loopback for port-forward access; empty disables the page")
 	serverBundle = pflag.String("server-cred-bundle", "", "credential bundle (PEM key+chain) presented for serving TLS (required)")
 	clientCAFile = pflag.String("client-ca-file", "", "CA bundle that caller (injector) client certificates must chain to (required)")
 	// The injector is the only caller allowed to fetch secrets. Its identity
@@ -63,6 +65,7 @@ var (
 	drainGrace       = pflag.Duration("drain-grace", 5*time.Second, "how long to wait for in-flight RPCs on shutdown before a hard stop")
 	kubeAPIQPS       = pflag.Float32("kube-api-qps", 50, "Sustained queries per second allowed against the Kubernetes API.")
 	kubeAPIBurst     = pflag.Int("kube-api-burst", 100, "Burst queries allowed against the Kubernetes API.")
+	previewFlags     = pflag.StringSlice("preview", nil, "Preview gates to enable.")
 )
 
 func main() {
@@ -72,6 +75,9 @@ func main() {
 	serverboot.InitLogger()
 	if err := serverboot.SetLogLevel(*logLevel); err != nil {
 		serverboot.Fatal(ctx, "invalid --log-level", err)
+	}
+	if err := preview.Init(*previewFlags...); err != nil {
+		serverboot.Fatal(ctx, "invalid --preview", err)
 	}
 
 	slog.InfoContext(ctx, "starting credprovider", slog.String("version", version.String()))
@@ -88,12 +94,7 @@ func run(ctx context.Context) error {
 	}
 	defer serverboot.ShutdownProvider("MeterProvider", mp.Shutdown)
 
-	readiness := &serverboot.Readiness{}
-	go serverboot.StartMetricsServer(ctx, serverboot.MetricsServerOptions{
-		Addr:          *metricsAddr,
-		Readiness:     readiness,
-		EnableHealthz: true,
-	})
+	go serverboot.StartMetricsServer(ctx, *metricsAddr)
 
 	client, err := newKubeClient()
 	if err != nil {
@@ -122,12 +123,17 @@ func run(ctx context.Context) error {
 	)
 	reflection.Register(srv)
 	provider := NewServer(client, nsAuth)
-	credproviderpb.RegisterCredentialProviderServer(srv, provider)
+	credprovider.RegisterCredentialProviderServer(srv, provider)
 
 	lis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", *listenAddr, err)
 	}
+
+	// The health server starts after the gRPC listener opens, so /readyz does
+	// not report 200 before the pod can accept calls.
+	readiness := &serverboot.Readiness{}
+	go serverboot.StartHealthServer(ctx, *healthAddr, readiness)
 
 	shutdownCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

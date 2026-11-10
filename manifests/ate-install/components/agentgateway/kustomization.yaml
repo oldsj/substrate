@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ patches:
         path: /spec/template/spec/containers/0
         value:
           name: agentgateway
-          image: ghcr.io/agentgateway/agentgateway:v0.0.0-alpha.9f9744cf
+          image: cr.agentgateway.dev/agentgateway:v1.7.0@sha256:60216aafb03d37f94e952ff3d51d2f630a65b10ecaebdc0a864882f92610c45b
           args:
           - -f
           - /etc/agentgateway/config.yaml
@@ -118,13 +118,17 @@ patches:
         path: /spec/template/spec/containers/0
         value:
           name: agentgateway
-          image: ghcr.io/agentgateway/agentgateway:v0.0.0-alpha.9f9744cf
+          image: cr.agentgateway.dev/agentgateway:v1.7.0@sha256:60216aafb03d37f94e952ff3d51d2f630a65b10ecaebdc0a864882f92610c45b
           args:
           - -f
           - /etc/agentgateway/config.yaml
           env:
           - name: RUST_LOG
             value: debug
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
           ports:
           - name: https
             containerPort: 8443
@@ -176,6 +180,8 @@ patches:
                   matchLabels:
                     podcert.ate.dev/canarying: live
                 path: trust-bundle.pem
+  # Agentgateway does not authenticate ingress clients yet, so it still serves
+  # the plaintext ports the Envoy router dropped.
   - target:
       version: v1
       kind: Service
@@ -189,3 +195,34 @@ patches:
           port: 15020
           targetPort: stats
           protocol: TCP
+      - op: add
+        path: /spec/ports/-
+        value:
+          name: http
+          port: 80
+          targetPort: 8080
+          protocol: TCP
+      - op: add
+        path: /spec/ports/-
+        value:
+          name: connect
+          port: 8081
+          targetPort: 8081
+          protocol: TCP
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: NetworkPolicy
+      name: atenet-router
+      namespace: ate-system
+    patch: |-
+      - op: add
+        path: /spec/ingress/0/ports/-
+        value:
+          protocol: TCP
+          port: http
+      - op: add
+        path: /spec/ingress/0/ports/-
+        value:
+          protocol: TCP
+          port: connect

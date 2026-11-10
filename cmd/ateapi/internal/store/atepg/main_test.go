@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/dockerenv"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/dockerenv"
 )
 
 // One Postgres container serves every test in this package; each test gets
@@ -109,4 +109,14 @@ func requirePool(t *testing.T) *pgxpool.Pool {
 		t.Skipf("PostgreSQL testcontainer unavailable (requires Docker): %v", containerErr)
 	}
 	return containerPool
+}
+
+func testConnectConfig(schema string) ConnectConfig {
+	return ConnectConfig{
+		ReadWriteDSN:  containerDSN,
+		OwnerDSN:      containerDSN,
+		ReadWriteRole: "atepg",
+		OwnerRole:     "atepg",
+		Schema:        schema,
+	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,7 +44,13 @@ import (
 // over plain HTTP).
 func newTestRegistry(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
-	srv := httptest.NewServer(registry.New(registry.Logger(log.New(io.Discard, "", 0))))
+	return newWrappedRegistry(t, func(h http.Handler) http.Handler { return h })
+}
+
+// newWrappedRegistry starts an in-memory OCI registry behind wrap.
+func newWrappedRegistry(t *testing.T, wrap func(http.Handler) http.Handler) (*httptest.Server, string) {
+	t.Helper()
+	srv := httptest.NewServer(wrap(registry.New(registry.Logger(log.New(io.Discard, "", 0)))))
 	t.Cleanup(srv.Close)
 	u, err := url.Parse(srv.URL)
 	if err != nil {
@@ -315,16 +321,6 @@ func TestNew_RecoveryAndVersioning(t *testing.T) {
 	}
 	if _, err := New(root); err == nil {
 		t.Errorf("New accepted an unknown layout version")
-	}
-}
-
-func TestNew_RejectsLegacyLayoutWithoutOwnerMetadata(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, versionFileName), []byte("1\n"), 0o600); err != nil {
-		t.Fatalf("writing legacy version marker: %v", err)
-	}
-	if _, err := New(root); err == nil {
-		t.Fatal("New accepted layout v1, whose cached layers lack owner metadata")
 	}
 }
 

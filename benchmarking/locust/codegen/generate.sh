@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ CODEGEN_DIR="benchmarking/locust/codegen"
 OUT_DIR="${OUT_DIR:-benchmarking/locust/common}"
 
 if [[ $# -eq 0 ]]; then
-    set -- pkg/proto/ateapipb/ateapi.proto internal/proto/glutton/glutton.proto
+    set -- api/ateapi/v1/ateapi.proto internal/proto/glutton/glutton.proto
 fi
 
 if [[ -z "${PYTHON:-}" ]]; then

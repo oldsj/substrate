@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,551 +16,18 @@ package controlapi
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/testing/protocmp"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/resources"
 )
-
-func TestValidateCreateTagRequest(t *testing.T) {
-	ctx := context.Background()
-	validTag := func(opts ...func(*ateapipb.Tag)) *ateapipb.Tag {
-		tag := &ateapipb.Tag{
-			Metadata:    &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "tag1"},
-			Scope:       ateapipb.TagScope_TAG_SCOPE_ATESPACE,
-			SourceActor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "id1"},
-		}
-		for _, opt := range opts {
-			opt(tag)
-		}
-		return tag
-	}
-	tests := []struct {
-		name      string
-		req       *ateapipb.CreateTagRequest
-		wantError field.ErrorList
-	}{
-		{
-			name:      "valid",
-			req:       &ateapipb.CreateTagRequest{Tag: validTag()},
-			wantError: nil,
-		},
-		{
-			// Status is server-owned and scrubbed before this runs, but a
-			// client that echoes back a tag it read is not to be tripped up by
-			// one either.
-			name: "valid with status",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) {
-					tag.Status = &ateapipb.TagStatus{
-						Snapshot:         validExternalSnapshot(),
-						ActorTemplateUid: someActorUID,
-						StorageLocation:  testStorageLocation,
-					}
-				}),
-			},
-			wantError: nil,
-		},
-		{
-			// The tag has to name the atespace it lands in, like every other
-			// create: the source Actor's atespace is checked against it, not
-			// used as a default.
-			name: "empty tag.metadata.atespace",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Atespace = "" }),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "metadata", "atespace"), "")},
-		},
-		{
-			// Malformed, so it is both rejected on its own terms and unable to
-			// match the source actor's.
-			name: "invalid tag.metadata.atespace",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Atespace = "NS1" }),
-			},
-			wantError: field.ErrorList{
-				field.Invalid(field.NewPath("tag", "metadata", "atespace"), nil, ""),
-				field.Invalid(field.NewPath("tag", "metadata", "atespace"), nil, "").WithOrigin("format=k8s-short-name"),
-			},
-		},
-		{
-			name: "missing tag.source_actor",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.SourceActor = nil }),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "source_actor"), "")},
-		},
-		{
-			// Only source_actor is reported: tag.metadata.atespace cannot be
-			// held against a source that has none to compare it to.
-			name: "missing tag.source_actor.atespace",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.SourceActor.Atespace = "" }),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "source_actor", "atespace"), "")},
-		},
-		{
-			// A malformed source atespace is also one the tag's own atespace
-			// cannot match, so both are reported.
-			name: "invalid tag.source_actor.atespace",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.SourceActor.Atespace = "NS1" }),
-			},
-			wantError: field.ErrorList{
-				field.Invalid(field.NewPath("tag", "metadata", "atespace"), nil, ""),
-				field.Invalid(field.NewPath("tag", "source_actor", "atespace"), nil, "").WithOrigin("format=k8s-short-name"),
-			},
-		},
-		{
-			name: "missing tag.source_actor.name",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.SourceActor.Name = "" }),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "source_actor", "name"), "")},
-		},
-		{
-			name: "invalid tag.source_actor.name",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.SourceActor.Name = "ID1" }),
-			},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "source_actor", "name"), nil, "").WithOrigin("format=k8s-short-name")},
-		},
-		{
-			name:      "missing tag",
-			req:       &ateapipb.CreateTagRequest{},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag"), "")},
-		},
-		{
-			name: "missing tag.metadata",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata = nil }),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "metadata"), "")},
-		},
-		{
-			name: "missing tag.metadata.name",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Name = "" }),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "metadata", "name"), "")},
-		},
-		{
-			name: "invalid tag.metadata.name",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Name = "TAG1" }),
-			},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "metadata", "name"), nil, "").WithOrigin("format=k8s-short-name")},
-		},
-		{
-			// A tag somewhere else than its source Actor could not be resolved
-			// back to it.
-			name: "tag.metadata.atespace is not the source actor's",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Atespace = "ns2" }),
-			},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "metadata", "atespace"), nil, "")},
-		},
-		{
-			name: "unset tag.scope",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) {
-					tag.Scope = ateapipb.TagScope_TAG_SCOPE_UNSPECIFIED
-				}),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "scope"), "")},
-		},
-		{
-			name: "tag.scope above the enum",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Scope = ateapipb.TagScope(7) }),
-			},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "scope"), nil, "").WithOrigin("maximum")},
-		},
-		{
-			name: "negative tag.scope",
-			req: &ateapipb.CreateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Scope = ateapipb.TagScope(-1) }),
-			},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "scope"), nil, "").WithOrigin("minimum")},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateCreateTagRequest(ctx, tt.req), tt.wantError)
-		})
-	}
-}
-
-func TestValidateUpdateTagRequest(t *testing.T) {
-	ctx := context.Background()
-	// validUID is a well-formed uid to pass validation.
-	const validUID = "2a5f8c1e-9b3d-4f7a-8e6c-1d0b4a7f2e93"
-	validTag := func(opts ...func(*ateapipb.Tag)) *ateapipb.Tag {
-		tag := &ateapipb.Tag{
-			Metadata:    &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "tag1", Uid: validUID, Version: 7},
-			Scope:       ateapipb.TagScope_TAG_SCOPE_PUBLISHED,
-			SourceActor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "id1"},
-		}
-		for _, opt := range opts {
-			opt(tag)
-		}
-		return tag
-	}
-	tests := []struct {
-		name      string
-		req       *ateapipb.UpdateTagRequest
-		wantError field.ErrorList
-	}{
-		{
-			name:      "valid",
-			req:       &ateapipb.UpdateTagRequest{Tag: validTag()},
-			wantError: nil,
-		},
-		{
-			name:      "missing tag",
-			req:       &ateapipb.UpdateTagRequest{},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag"), "")},
-		},
-		{
-			name: "missing tag.metadata",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata = nil }),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "metadata"), "")},
-		},
-		{
-			name: "missing tag.metadata.atespace",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Atespace = "" }),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "metadata", "atespace"), "")},
-		},
-		{
-			name: "invalid tag.metadata.atespace",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Atespace = "NS1" }),
-			},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "metadata", "atespace"), nil, "").WithOrigin("format=k8s-short-name")},
-		},
-		{
-			name: "missing tag.metadata.name",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Name = "" }),
-			},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "metadata", "name"), "")},
-		},
-		{
-			name: "invalid tag.metadata.name",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Name = "TAG1" }),
-			},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "metadata", "name"), nil, "").WithOrigin("format=k8s-short-name")},
-		},
-		{
-			// The preconditions are the store's to insist on, not the schema's:
-			// an update carrying neither is rejected as a blind write once it
-			// reaches the store. See TestUpdateTag_BlindWrite.
-			name: "missing tag.metadata.uid precondition",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Uid = "" }),
-			},
-			wantError: nil,
-		},
-		{
-			name: "invalid tag.metadata.uid precondition",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Uid = "not-a-uuid" }),
-			},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "metadata", "uid"), nil, "").WithOrigin("format=k8s-uuid")},
-		},
-		{
-			name: "missing tag.metadata.version precondition",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Version = 0 }),
-			},
-			wantError: nil,
-		},
-		{
-			name: "negative tag.metadata.version precondition",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) { tag.Metadata.Version = -1 }),
-			},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "metadata", "version"), nil, "").WithOrigin("minimum")},
-		},
-		{
-			// Nothing about the tag body is held against the request: it is
-			// checked against the stored tag instead, so a source or a scope
-			// the request gets wrong is caught there.
-			name: "tag body is not checked against the request",
-			req: &ateapipb.UpdateTagRequest{
-				Tag: validTag(func(tag *ateapipb.Tag) {
-					tag.SourceActor = nil
-					tag.Scope = ateapipb.TagScope_TAG_SCOPE_UNSPECIFIED
-				}),
-			},
-			wantError: nil,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateUpdateTagRequest(ctx, tt.req), tt.wantError)
-		})
-	}
-}
-
-// TestValidateTagUpdateResult covers the second half of an update:
-// the merged tag the server is about to write, checked against the one it
-// replaces. This is where everything the request could not be held to lands.
-func TestValidateTagUpdateResult(t *testing.T) {
-	ctx := context.Background()
-	tagPath := field.NewPath("tag")
-	storedTag := func(opts ...func(*ateapipb.Tag)) *ateapipb.Tag {
-		tag := &ateapipb.Tag{
-			Metadata:    &ateapipb.ResourceMetadata{Atespace: "ns1", Name: "tag1", Uid: "2a5f8c1e-9b3d-4f7a-8e6c-1d0b4a7f2e93", Version: 7},
-			Scope:       ateapipb.TagScope_TAG_SCOPE_ATESPACE,
-			SourceActor: &ateapipb.ObjectRef{Atespace: "ns1", Name: "id1"},
-		}
-		for _, opt := range opts {
-			opt(tag)
-		}
-		return tag
-	}
-	tests := []struct {
-		name      string
-		newVal    *ateapipb.Tag
-		wantError field.ErrorList
-	}{
-		{
-			name:      "unchanged",
-			newVal:    storedTag(),
-			wantError: nil,
-		},
-		{
-			name: "publishing is allowed",
-			newVal: storedTag(func(tag *ateapipb.Tag) {
-				tag.Scope = ateapipb.TagScope_TAG_SCOPE_PUBLISHED
-			}),
-			wantError: nil,
-		},
-		{
-			name: "unset tag.scope",
-			newVal: storedTag(func(tag *ateapipb.Tag) {
-				tag.Scope = ateapipb.TagScope_TAG_SCOPE_UNSPECIFIED
-			}),
-			wantError: field.ErrorList{field.Required(tagPath.Child("scope"), "")},
-		},
-		{
-			name:      "tag.scope above the enum",
-			newVal:    storedTag(func(tag *ateapipb.Tag) { tag.Scope = ateapipb.TagScope(7) }),
-			wantError: field.ErrorList{field.Invalid(tagPath.Child("scope"), nil, "").WithOrigin("maximum")},
-		},
-		{
-			name:      "negative tag.scope",
-			newVal:    storedTag(func(tag *ateapipb.Tag) { tag.Scope = ateapipb.TagScope(-1) }),
-			wantError: field.ErrorList{field.Invalid(tagPath.Child("scope"), nil, "").WithOrigin("minimum")},
-		},
-		{
-			// A tag never moves between snapshots, so it never moves between
-			// sources either.
-			name: "repointed tag.source_actor",
-			newVal: storedTag(func(tag *ateapipb.Tag) {
-				tag.SourceActor = &ateapipb.ObjectRef{Atespace: "ns1", Name: "id2"}
-			}),
-			wantError: field.ErrorList{field.Invalid(tagPath.Child("source_actor"), nil, "").WithOrigin("immutable")},
-		},
-		{
-			// An update is a whole-object replace, so a client that drops the
-			// source it read back would clear it.
-			name:   "missing tag.source_actor",
-			newVal: storedTag(func(tag *ateapipb.Tag) { tag.SourceActor = nil }),
-			wantError: field.ErrorList{
-				field.Invalid(tagPath.Child("source_actor"), nil, "").WithOrigin("immutable"),
-				field.Required(tagPath.Child("source_actor"), ""),
-			},
-		},
-		{
-			// The tag is addressed through its atespace and name; moving it
-			// would strand every reference to it.
-			name:      "renamed tag",
-			newVal:    storedTag(func(tag *ateapipb.Tag) { tag.Metadata.Name = "tag2" }),
-			wantError: field.ErrorList{field.Invalid(tagPath.Child("metadata", "name"), nil, "").WithOrigin("immutable")},
-		},
-		{
-			name:      "tag moved to another atespace",
-			newVal:    storedTag(func(tag *ateapipb.Tag) { tag.Metadata.Atespace = "ns2" }),
-			wantError: field.ErrorList{field.Invalid(tagPath.Child("metadata", "atespace"), nil, "").WithOrigin("immutable")},
-		},
-		{
-			name:   "cleared tag.metadata.atespace",
-			newVal: storedTag(func(tag *ateapipb.Tag) { tag.Metadata.Atespace = "" }),
-			wantError: field.ErrorList{
-				field.Required(tagPath.Child("metadata", "atespace"), ""),
-				field.Invalid(tagPath.Child("metadata", "atespace"), nil, "").WithOrigin("immutable"),
-			},
-		},
-		{
-			name:      "missing tag.metadata",
-			newVal:    storedTag(func(tag *ateapipb.Tag) { tag.Metadata = nil }),
-			wantError: field.ErrorList{field.Required(tagPath.Child("metadata"), "")},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateTagUpdate(ctx, tagPath, tt.newVal, storedTag()), tt.wantError)
-		})
-	}
-}
-
-func TestValidateListTagsRequest(t *testing.T) {
-	ctx := context.Background()
-	tests := []struct {
-		name      string
-		req       *ateapipb.ListTagsRequest
-		wantError field.ErrorList
-	}{
-		{
-			name:      "valid, atespace scoped",
-			req:       &ateapipb.ListTagsRequest{Atespace: "ns1"},
-			wantError: nil,
-		},
-		{
-			// Empty atespace means "all atespaces"
-			// (kubectl ate get tags -A).
-			name:      "valid, empty atespace means all atespaces",
-			req:       &ateapipb.ListTagsRequest{},
-			wantError: nil,
-		},
-		{
-			name:      "invalid atespace",
-			req:       &ateapipb.ListTagsRequest{Atespace: "NS1"},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("atespace"), nil, "").WithOrigin("format=k8s-short-name")},
-		},
-		{
-			name:      "valid, positive page_size",
-			req:       &ateapipb.ListTagsRequest{Atespace: "ns1", PageSize: 10},
-			wantError: nil,
-		},
-		{
-			name:      "negative page_size",
-			req:       &ateapipb.ListTagsRequest{Atespace: "ns1", PageSize: -1},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("page_size"), nil, "").WithOrigin("minimum")},
-		},
-		{
-			name:      "valid page_token",
-			req:       &ateapipb.ListTagsRequest{Atespace: "ns1", PageToken: strings.Repeat("x", 256)},
-			wantError: nil,
-		},
-		{
-			name:      "too-large page_token",
-			req:       &ateapipb.ListTagsRequest{Atespace: "ns1", PageToken: strings.Repeat("x", 257)},
-			wantError: field.ErrorList{field.TooLongCharacters(field.NewPath("page_token"), "", 256).WithOrigin("maxLength")},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateListTagsRequest(ctx, tt.req), tt.wantError)
-		})
-	}
-}
-
-func TestValidateGetTagRequest(t *testing.T) {
-	ctx := context.Background()
-	tests := []struct {
-		name      string
-		req       *ateapipb.GetTagRequest
-		wantError field.ErrorList
-	}{
-		{
-			name:      "valid",
-			req:       &ateapipb.GetTagRequest{Tag: &ateapipb.ObjectRef{Atespace: "ns1", Name: "tag1"}},
-			wantError: nil,
-		},
-		{
-			name:      "missing tag",
-			req:       &ateapipb.GetTagRequest{},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag"), "")},
-		},
-		{
-			name:      "missing tag.atespace",
-			req:       &ateapipb.GetTagRequest{Tag: &ateapipb.ObjectRef{Name: "tag1"}},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "atespace"), "")},
-		},
-		{
-			name:      "invalid tag.atespace",
-			req:       &ateapipb.GetTagRequest{Tag: &ateapipb.ObjectRef{Atespace: "NS1", Name: "tag1"}},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "atespace"), nil, "").WithOrigin("format=k8s-short-name")},
-		},
-		{
-			name:      "missing tag.name",
-			req:       &ateapipb.GetTagRequest{Tag: &ateapipb.ObjectRef{Atespace: "ns1"}},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "name"), "")},
-		},
-		{
-			name:      "invalid tag.name",
-			req:       &ateapipb.GetTagRequest{Tag: &ateapipb.ObjectRef{Atespace: "ns1", Name: "TAG1"}},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "name"), nil, "").WithOrigin("format=k8s-short-name")},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateGetTagRequest(ctx, tt.req), tt.wantError)
-		})
-	}
-}
-
-func TestValidateDeleteTagRequest(t *testing.T) {
-	ctx := context.Background()
-	tests := []struct {
-		name      string
-		req       *ateapipb.DeleteTagRequest
-		wantError field.ErrorList
-	}{
-		{
-			name:      "valid",
-			req:       &ateapipb.DeleteTagRequest{Tag: &ateapipb.ObjectRef{Atespace: "ns1", Name: "tag1"}},
-			wantError: nil,
-		},
-		{
-			name:      "missing tag",
-			req:       &ateapipb.DeleteTagRequest{},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag"), "")},
-		},
-		{
-			name:      "missing tag.atespace",
-			req:       &ateapipb.DeleteTagRequest{Tag: &ateapipb.ObjectRef{Name: "tag1"}},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "atespace"), "")},
-		},
-		{
-			name:      "invalid tag.atespace",
-			req:       &ateapipb.DeleteTagRequest{Tag: &ateapipb.ObjectRef{Atespace: "NS1", Name: "tag1"}},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "atespace"), nil, "").WithOrigin("format=k8s-short-name")},
-		},
-		{
-			name:      "missing tag.name",
-			req:       &ateapipb.DeleteTagRequest{Tag: &ateapipb.ObjectRef{Atespace: "ns1"}},
-			wantError: field.ErrorList{field.Required(field.NewPath("tag", "name"), "")},
-		},
-		{
-			name:      "invalid tag.name",
-			req:       &ateapipb.DeleteTagRequest{Tag: &ateapipb.ObjectRef{Atespace: "ns1", Name: "TAG1"}},
-			wantError: field.ErrorList{field.Invalid(field.NewPath("tag", "name"), nil, "").WithOrigin("format=k8s-short-name")},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assertValidateErr(t, validateDeleteTagRequest(ctx, tt.req), tt.wantError)
-		})
-	}
-}
 
 // TestListTags checks the atespace scoping and the paging of the
 // list handler.
@@ -582,7 +49,7 @@ func TestListTags(t *testing.T) {
 
 	// list collects every page, so the assertions below cover the page token
 	// round-trip as well as the contents.
-	list := func(req *ateapipb.ListTagsRequest) []string {
+	list := func(req *ateapi.ListTagsRequest) []string {
 		t.Helper()
 		var got []string
 		for {
@@ -596,33 +63,33 @@ func TestListTags(t *testing.T) {
 			if resp.GetNextPageToken() == "" {
 				return got
 			}
-			req.PageToken = resp.GetNextPageToken()
+			req.Options = &ateapi.ListOptions{PageSize: req.GetOptions().GetPageSize(), PageToken: resp.GetNextPageToken()}
 		}
 	}
 
 	tests := []struct {
 		name string
-		req  *ateapipb.ListTagsRequest
+		req  *ateapi.ListTagsRequest
 		want []string
 	}{
 		{
 			name: "atespace scoped",
-			req:  &ateapipb.ListTagsRequest{Atespace: testAtespace},
+			req:  &ateapi.ListTagsRequest{Atespace: testAtespace},
 			want: []string{testAtespace + "/v1", testAtespace + "/v2"},
 		},
 		{
 			name: "empty atespace lists all atespaces",
-			req:  &ateapipb.ListTagsRequest{},
+			req:  &ateapi.ListTagsRequest{},
 			want: []string{otherAtespace + "/v1", testAtespace + "/v1", testAtespace + "/v2"},
 		},
 		{
 			name: "one tag per page",
-			req:  &ateapipb.ListTagsRequest{PageSize: 1},
+			req:  &ateapi.ListTagsRequest{Options: &ateapi.ListOptions{PageSize: 1}},
 			want: []string{otherAtespace + "/v1", testAtespace + "/v1", testAtespace + "/v2"},
 		},
 		{
 			name: "atespace with no tags",
-			req:  &ateapipb.ListTagsRequest{Atespace: "empty-atespace"},
+			req:  &ateapi.ListTagsRequest{Atespace: "empty-atespace"},
 			want: nil,
 		},
 	}
@@ -634,8 +101,8 @@ func TestListTags(t *testing.T) {
 		})
 	}
 
-	_, err := svc.ListTags(ctx, &ateapipb.ListTagsRequest{PageToken: "not-a-token"})
-	if code := status.Code(err); code != codes.InvalidArgument {
+	_, err := svc.ListTags(ctx, &ateapi.ListTagsRequest{Options: &ateapi.ListOptions{PageToken: "not-a-token"}})
+	if code := apierror.Code(err); code != codes.InvalidArgument {
 		t.Errorf("ListTags(bad page_token) error = %v (code %v), want code InvalidArgument", err, code)
 	}
 }
@@ -643,52 +110,52 @@ func TestListTags(t *testing.T) {
 func TestUpdateTag(t *testing.T) {
 	tests := []struct {
 		name     string
-		stored   *ateapipb.Tag
-		req      *ateapipb.Tag
-		want     *ateapipb.Tag
+		stored   *ateapi.Tag
+		req      *ateapi.Tag
+		want     *ateapi.Tag
 		wantCode codes.Code
 	}{
 		{
 			name:   "publishes an atespace-scoped tag",
-			stored: &ateapipb.Tag{Scope: ateapipb.TagScope_TAG_SCOPE_ATESPACE},
-			req:    &ateapipb.Tag{Scope: ateapipb.TagScope_TAG_SCOPE_PUBLISHED},
-			want:   &ateapipb.Tag{Scope: ateapipb.TagScope_TAG_SCOPE_PUBLISHED},
+			stored: &ateapi.Tag{Scope: ateapi.TagScope_TAG_SCOPE_ATESPACE},
+			req:    &ateapi.Tag{Scope: ateapi.TagScope_TAG_SCOPE_PUBLISHED},
+			want:   &ateapi.Tag{Scope: ateapi.TagScope_TAG_SCOPE_PUBLISHED},
 		},
 		{
 			name:   "unpublishes a published tag",
-			stored: &ateapipb.Tag{Scope: ateapipb.TagScope_TAG_SCOPE_PUBLISHED},
-			req:    &ateapipb.Tag{Scope: ateapipb.TagScope_TAG_SCOPE_ATESPACE},
-			want:   &ateapipb.Tag{Scope: ateapipb.TagScope_TAG_SCOPE_ATESPACE},
+			stored: &ateapi.Tag{Scope: ateapi.TagScope_TAG_SCOPE_PUBLISHED},
+			req:    &ateapi.Tag{Scope: ateapi.TagScope_TAG_SCOPE_ATESPACE},
+			want:   &ateapi.Tag{Scope: ateapi.TagScope_TAG_SCOPE_ATESPACE},
 		},
 		{
 			// scope is the only field a client owns: a request rewriting
 			// server-owned fields is applied as a scope change alone.
 			name:   "server-owned fields in the request are ignored",
-			stored: &ateapipb.Tag{Scope: ateapipb.TagScope_TAG_SCOPE_ATESPACE},
-			req: &ateapipb.Tag{
-				Scope: ateapipb.TagScope_TAG_SCOPE_PUBLISHED,
-				Status: &ateapipb.TagStatus{
-					Snapshot:         &ateapipb.ExternalSnapshot{SnapshotUri: "gs://attacker/elsewhere", ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA},
+			stored: &ateapi.Tag{Scope: ateapi.TagScope_TAG_SCOPE_ATESPACE},
+			req: &ateapi.Tag{
+				Scope: ateapi.TagScope_TAG_SCOPE_PUBLISHED,
+				Status: &ateapi.TagStatus{
+					Snapshot:         newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_TAG, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, "", "elsewhere", "gs://attacker/elsewhere", ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED),
 					ActorTemplateUid: "other-template-uid",
 				},
 			},
-			want: &ateapipb.Tag{Scope: ateapipb.TagScope_TAG_SCOPE_PUBLISHED},
+			want: &ateapi.Tag{Scope: ateapi.TagScope_TAG_SCOPE_PUBLISHED},
 		},
 		{
 			// A tag never moves between snapshots, so it never moves between
 			// sources either.
 			name:   "repointing source_actor is rejected",
-			stored: &ateapipb.Tag{Scope: ateapipb.TagScope_TAG_SCOPE_ATESPACE},
-			req: &ateapipb.Tag{
-				Scope:       ateapipb.TagScope_TAG_SCOPE_PUBLISHED,
-				SourceActor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "someone-elses-actor"},
+			stored: &ateapi.Tag{Scope: ateapi.TagScope_TAG_SCOPE_ATESPACE},
+			req: &ateapi.Tag{
+				Scope:       ateapi.TagScope_TAG_SCOPE_PUBLISHED,
+				SourceActor: &ateapi.ObjectRef{Atespace: testAtespace, Name: "someone-elses-actor"},
 			},
 			wantCode: codes.InvalidArgument,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.stored.Metadata = &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "tag1"}
+			tt.stored.Metadata = &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "tag1"}
 			svc, stored := rpcServiceWithTag(t, tt.stored)
 
 			tt.req.Metadata = stored.GetMetadata()
@@ -698,10 +165,10 @@ func TestUpdateTag(t *testing.T) {
 				tt.req.SourceActor = stored.GetSourceActor()
 			}
 
-			updated, err := svc.UpdateTag(context.Background(), &ateapipb.UpdateTagRequest{Tag: tt.req})
+			updated, err := svc.UpdateTag(context.Background(), &ateapi.UpdateTagRequest{Tag: tt.req})
 
 			if tt.wantCode != codes.OK {
-				if code := status.Code(err); code != tt.wantCode {
+				if code := apierror.Code(err); code != tt.wantCode {
 					t.Errorf("UpdateTag error = %v (code %v), want code %v", err, code, tt.wantCode)
 				}
 				return
@@ -710,7 +177,7 @@ func TestUpdateTag(t *testing.T) {
 				t.Fatalf("UpdateTag failed: %v", err)
 			}
 
-			tt.want.Metadata = &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "tag1", Version: 2}
+			tt.want.Metadata = &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "tag1", Version: 2}
 			tt.want.Status, tt.want.SourceActor = stored.GetStatus(), stored.GetSourceActor()
 			if diff := cmp.Diff(tt.want, updated, protocmp.Transform(), ignoreUID, ignoreTimestamps); diff != "" {
 				t.Errorf("UpdateTag response mismatch (-want +got):\n%s", diff)
@@ -723,15 +190,15 @@ func TestUpdateTag(t *testing.T) {
 // uid nor a version is rejected. The schema does not require them — the store
 // does, because a caller that read nothing has nothing to lose a race with.
 func TestUpdateTag_BlindWrite(t *testing.T) {
-	svc, stored := rpcServiceWithTag(t, &ateapipb.Tag{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "tag1"},
-		Scope:    ateapipb.TagScope_TAG_SCOPE_ATESPACE,
+	svc, stored := rpcServiceWithTag(t, &ateapi.Tag{
+		Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "tag1"},
+		Scope:    ateapi.TagScope_TAG_SCOPE_ATESPACE,
 	})
 
 	stored.Metadata.Uid, stored.Metadata.Version = "", 0
-	stored.Scope = ateapipb.TagScope_TAG_SCOPE_PUBLISHED
-	_, err := svc.UpdateTag(context.Background(), &ateapipb.UpdateTagRequest{Tag: stored})
-	if code := status.Code(err); code != codes.InvalidArgument {
+	stored.Scope = ateapi.TagScope_TAG_SCOPE_PUBLISHED
+	_, err := svc.UpdateTag(context.Background(), &ateapi.UpdateTagRequest{Tag: stored})
+	if code := apierror.Code(err); code != codes.InvalidArgument {
 		t.Errorf("UpdateTag error = %v (code %v), want code InvalidArgument", err, code)
 	}
 }
@@ -740,18 +207,18 @@ func TestUpdateTag_BlindWrite(t *testing.T) {
 // leaving scope unset is rejected.
 func TestUpdateTag_UnsetScopeDoesNotUnpublish(t *testing.T) {
 	ctx := context.Background()
-	svc, stored := rpcServiceWithTag(t, &ateapipb.Tag{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "tag1"},
-		Scope:    ateapipb.TagScope_TAG_SCOPE_PUBLISHED,
+	svc, stored := rpcServiceWithTag(t, &ateapi.Tag{
+		Metadata: &ateapi.ResourceMetadata{Atespace: testAtespace, Name: "tag1"},
+		Scope:    ateapi.TagScope_TAG_SCOPE_PUBLISHED,
 	})
 
 	// The guards are the ones the client read, so the rejection can only come
 	// from the unset scope.
-	stored.Scope = ateapipb.TagScope_TAG_SCOPE_UNSPECIFIED
-	_, err := svc.UpdateTag(ctx, &ateapipb.UpdateTagRequest{
+	stored.Scope = ateapi.TagScope_TAG_SCOPE_UNSPECIFIED
+	_, err := svc.UpdateTag(ctx, &ateapi.UpdateTagRequest{
 		Tag: stored,
 	})
-	if code := status.Code(err); code != codes.InvalidArgument {
+	if code := apierror.Code(err); code != codes.InvalidArgument {
 		t.Errorf("UpdateTag error = %v (code %v), want code InvalidArgument", err, code)
 	}
 
@@ -759,7 +226,7 @@ func TestUpdateTag_UnsetScopeDoesNotUnpublish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTag: %v", err)
 	}
-	if got, want := current.GetScope(), ateapipb.TagScope_TAG_SCOPE_PUBLISHED; got != want {
+	if got, want := current.GetScope(), ateapi.TagScope_TAG_SCOPE_PUBLISHED; got != want {
 		t.Errorf("stored scope = %v, want %v: the rejected update must not have unpublished the tag", got, want)
 	}
 	if got, want := current.GetMetadata().GetVersion(), stored.GetMetadata().GetVersion(); got != want {
@@ -768,12 +235,12 @@ func TestUpdateTag_UnsetScopeDoesNotUnpublish(t *testing.T) {
 }
 
 // newTestSuspendedActor creates a suspended actor holding an external snapshot.
-func newTestSuspendedActor(t *testing.T, ctx context.Context, st store.Interface, atespace, name string) *ateapipb.Actor {
+func newTestSuspendedActor(t *testing.T, ctx context.Context, st store.Interface, atespace, name string) *ateapi.Actor {
 	t.Helper()
-	actor := storetest.MustCreateActor(t, ctx, st, &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: atespace, Name: name},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "template-1"},
-		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	actor := storetest.MustCreateActor(t, ctx, st, &ateapi.Actor{
+		Metadata:      &ateapi.ResourceMetadata{Atespace: atespace, Name: name},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "template-1"},
+		Status:        &ateapi.ActorStatus{State: ateapi.ActorState_ACTOR_STATE_SUSPENDED},
 	})
 	// The snapshot sits under the actor's own prefix, which is keyed on the UID
 	// the store assigns, so it can only be recorded once the row exists.
@@ -781,49 +248,49 @@ func newTestSuspendedActor(t *testing.T, ctx context.Context, st store.Interface
 	if err != nil {
 		t.Fatalf("NewActorSnapshotURI: %v", err)
 	}
-	return mustUpdateActorStatus(t, ctx, st, actor, func(status *ateapipb.ActorStatus) {
-		status.ExternalSnapshot = &ateapipb.ExternalSnapshot{SnapshotUri: uri.String(), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL}
+	return mustUpdateActorStatus(t, ctx, st, actor, func(status *ateapi.ActorStatus) {
+		status.LastAssignedGeneration = 1
+		status.Snapshots = []*ateapi.Snapshot{
+			newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", uri.Name(), uri.String(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED),
+		}
 	})
 }
 
 // newTestTag builds a finished tag of actor: the shape
 // CreateTag leaves behind, pointing at the tag's own copy of the
 // actor's external snapshot rather than at the actor's.
-func newTestTag(t *testing.T, name string, actor *ateapipb.Actor) *ateapipb.Tag {
+func newTestTag(t *testing.T, name string, actor *ateapi.Actor) *ateapi.Tag {
 	t.Helper()
 	atespace := actor.GetMetadata().GetAtespace()
 	uri, err := resources.NewTagSnapshotURI(testStorageLocation, atespace, name)
 	if err != nil {
 		t.Fatalf("NewTagSnapshotURI: %v", err)
 	}
-	return &ateapipb.Tag{
-		Metadata:    &ateapipb.ResourceMetadata{Atespace: atespace, Name: name},
-		Scope:       ateapipb.TagScope_TAG_SCOPE_ATESPACE,
+	actorSnap := findLatestDurableSnapshot(actor.GetStatus(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED)
+	return &ateapi.Tag{
+		Metadata:    &ateapi.ResourceMetadata{Atespace: atespace, Name: name},
+		Scope:       ateapi.TagScope_TAG_SCOPE_ATESPACE,
 		SourceActor: resources.ActorRefFromActor(actor).ToObjectRef(),
-		Status: &ateapipb.TagStatus{
-			Snapshot: &ateapipb.ExternalSnapshot{
-				SnapshotUri:  uri.String(),
-				ContentScope: actor.GetStatus().GetExternalSnapshot().GetContentScope(),
-			},
+		Status: &ateapi.TagStatus{
+			Snapshot: newDurableSnapshot(1, ateapi.SnapshotOwner_SNAPSHOT_OWNER_TAG, actorSnap.GetFidelity(), actorSnap.GetActorTemplateUid(), uri.Name(), uri.String(), ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED),
 		},
 	}
 }
 
 // newPendingTestTag builds the tag a create leaves behind when it dies between
 // reserving the name and finishing the copy: the row names the prefix it was
-// writing into, and nothing else.
-func newPendingTestTag(t *testing.T, name string, actor *ateapipb.Actor) *ateapipb.Tag {
+// writing into as PENDING.
+func newPendingTestTag(t *testing.T, name string, actor *ateapi.Actor) *ateapi.Tag {
 	t.Helper()
 	tag := newTestTag(t, name, actor)
-	tag.Status.StorageLocation = testStorageLocation
-	tag.Status.Snapshot = nil
+	tag.Status.Snapshot.DurableSnapshot.State = ateapi.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING
 	return tag
 }
 
 // rpcServiceWithTag seeds a suspended actor and a tag over its
 // external snapshot in a PostgreSQL-backed store, and returns an RPCService
 // over it.
-func rpcServiceWithTag(t *testing.T, tag *ateapipb.Tag) (*RPCService, *ateapipb.Tag) {
+func rpcServiceWithTag(t *testing.T, tag *ateapi.Tag) (*RPCService, *ateapi.Tag) {
 	t.Helper()
 	ctx := context.Background()
 	persistence, cleanup := storetest.SetupTestStore(t)
@@ -853,11 +320,15 @@ func TestUpdateTag_DeleteRecreateRace(t *testing.T) {
 
 	// A concurrent client deletes A and re-tags the same atespace/name as a
 	// brand new tag B, pointed at another snapshot.
-	var recreatedTag *ateapipb.Tag
+	var recreatedTag *ateapi.Tag
 	racing := &conflictInjectingStore{
 		Interface: persistence,
 		inject: func() {
-			if _, err := persistence.DeleteTag(ctx, resources.TagRef{Atespace: testAtespace, Name: tagName}, store.DeletePreconditions{}); err != nil {
+			tagRef := resources.TagRef{Atespace: testAtespace, Name: tagName}
+			if _, err := persistence.MarkTagForDeletion(ctx, tagRef, store.DeletePreconditions{}, nil); err != nil {
+				t.Fatalf("Racing writer: MarkTagForDeletion: %v", err)
+			}
+			if _, err := persistence.DeleteTag(ctx, tagRef, store.DeletePreconditions{}); err != nil {
 				t.Fatalf("Racing writer: DeleteTag: %v", err)
 			}
 			recreatedTag = storetest.MustCreateTag(t, ctx, persistence, newTestTag(t, tagName, actorTwo))
@@ -868,11 +339,11 @@ func TestUpdateTag_DeleteRecreateRace(t *testing.T) {
 	// The client asserts "only update the tag with uid A". Its version guard is
 	// satisfied by B as well, because re-tagging resets the version to 1: the
 	// uid is the only thing that can tell the two lifecycles apart.
-	originalTag.Scope = ateapipb.TagScope_TAG_SCOPE_PUBLISHED
-	_, err := svc.UpdateTag(ctx, &ateapipb.UpdateTagRequest{
+	originalTag.Scope = ateapi.TagScope_TAG_SCOPE_PUBLISHED
+	_, err := svc.UpdateTag(ctx, &ateapi.UpdateTagRequest{
 		Tag: originalTag,
 	})
-	if code := status.Code(err); code != codes.Aborted {
+	if code := apierror.Code(err); code != codes.Aborted {
 		t.Errorf("UpdateTag error = %v (code %v), want code Aborted: the tag holding uid %s was deleted mid-update",
 			err, code, originalTag.GetMetadata().GetUid())
 	}
@@ -907,8 +378,8 @@ func TestUpdateTag_ConcurrentUpdate(t *testing.T) {
 	racing := &conflictInjectingStore{
 		Interface: persistence,
 		inject: func() {
-			if _, err := persistence.UpdateTag(ctx, resources.TagRef{Atespace: testAtespace, Name: tagName}, store.PreconditionFrom(originalTag), func(toUpdate *ateapipb.Tag) error {
-				toUpdate.Scope = ateapipb.TagScope_TAG_SCOPE_ATESPACE
+			if _, err := persistence.UpdateTag(ctx, resources.TagRef{Atespace: testAtespace, Name: tagName}, store.PreconditionFrom(originalTag), func(toUpdate *ateapi.Tag) error {
+				toUpdate.Scope = ateapi.TagScope_TAG_SCOPE_ATESPACE
 				return nil
 			}); err != nil {
 				t.Fatalf("Racing writer: UpdateTag: %v", err)
@@ -917,11 +388,11 @@ func TestUpdateTag_ConcurrentUpdate(t *testing.T) {
 	}
 	svc := &RPCService{impl: newServiceImpl(racing, nil)}
 
-	originalTag.Scope = ateapipb.TagScope_TAG_SCOPE_PUBLISHED
-	_, err := svc.UpdateTag(ctx, &ateapipb.UpdateTagRequest{
+	originalTag.Scope = ateapi.TagScope_TAG_SCOPE_PUBLISHED
+	_, err := svc.UpdateTag(ctx, &ateapi.UpdateTagRequest{
 		Tag: originalTag,
 	})
-	if code := status.Code(err); code != codes.Aborted {
+	if code := apierror.Code(err); code != codes.Aborted {
 		t.Errorf("UpdateTag error = %v (code %v), want code Aborted: the guarded version moved under the update", err, code)
 	}
 
@@ -934,7 +405,7 @@ func TestUpdateTag_ConcurrentUpdate(t *testing.T) {
 	if got, want := storedTag.GetMetadata().GetVersion(), originalTag.GetMetadata().GetVersion()+1; got != want {
 		t.Errorf("stored version = %d, want %d", got, want)
 	}
-	if got, want := storedTag.GetScope(), ateapipb.TagScope_TAG_SCOPE_ATESPACE; got != want {
+	if got, want := storedTag.GetScope(), ateapi.TagScope_TAG_SCOPE_ATESPACE; got != want {
 		t.Errorf("Stored scope = %v, want %v: the rejected update was applied anyway", got, want)
 	}
 }
@@ -951,9 +422,9 @@ func TestUpdateTag_PendingTag(t *testing.T) {
 	actor := newTestSuspendedActor(t, ctx, persistence, testAtespace, "actor-1")
 	tag := storetest.MustCreateTag(t, ctx, persistence, newPendingTestTag(t, "v1", actor))
 
-	tag.Scope = ateapipb.TagScope_TAG_SCOPE_PUBLISHED
-	_, err := svc.UpdateTag(ctx, &ateapipb.UpdateTagRequest{Tag: tag})
-	if code := status.Code(err); code != codes.FailedPrecondition {
+	tag.Scope = ateapi.TagScope_TAG_SCOPE_PUBLISHED
+	_, err := svc.UpdateTag(ctx, &ateapi.UpdateTagRequest{Tag: tag})
+	if code := apierror.Code(err); code != codes.FailedPrecondition {
 		t.Fatalf("UpdateTag error = %v (code %v), want code FailedPrecondition", err, code)
 	}
 
@@ -961,7 +432,7 @@ func TestUpdateTag_PendingTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTag: %v", err)
 	}
-	if got, want := stored.GetScope(), ateapipb.TagScope_TAG_SCOPE_ATESPACE; got != want {
+	if got, want := stored.GetScope(), ateapi.TagScope_TAG_SCOPE_ATESPACE; got != want {
 		t.Errorf("stored scope = %v, want %v: the rejected update published a pending tag", got, want)
 	}
 }

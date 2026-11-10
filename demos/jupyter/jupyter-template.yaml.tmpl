@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ActorTemplate (protojson-shaped ateapipb.ActorTemplate) for the jupyter
+# ActorTemplate (protojson-shaped ateapi.ActorTemplate) for the jupyter
 # demo. Applied with `kubectl ate create actor-template -f -`; the
 # ate-demo-jupyter atespace must exist. The image is already pinned by
 # digest, so ko resolve passes it through unchanged.
@@ -28,7 +28,6 @@ containers:
   command:
   - jupyter
   - lab
-  - "--allow-root"
   - "--ServerApp.token=''"
   - "--ServerApp.password=''"
   - "--ServerApp.allow_origin='*'"
@@ -39,10 +38,11 @@ containers:
     httpGet:
       path: /api
       port: 80
+# Sandbox size: room for a few kernels and their data next to the Jupyter
+# server.
+resources:
+  limits:
+    cpuMillicores: 2000
+    memoryBytes: 4294967296 # 4Gi
 snapshotConfig:
-  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
-  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
-  storageLocation: gs://${BUCKET_NAME}/ate-demo-jupyter/
-sandboxConfig:
-  sandboxClass: SANDBOX_CLASS_GVISOR
-  configName: gvisor-default
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY

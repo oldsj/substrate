@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,19 +16,28 @@ package egress
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
+	"strings"
+	"time"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
-	"github.com/agent-substrate/substrate/internal/egresspolicy"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"github.com/agent-substrate/substrate/pkg/proto/credproviderpb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/api/credprovider/v1"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/egresspolicy"
+	"go.ate.dev/substrate/internal/resources"
 )
+
+// injectionTimeout caps resolving a request's credentials, under the ext_proc
+// message_timeout so a slow provider is a retryable 503 instead of an Envoy 504
+const injectionTimeout = 4 * time.Second
 
 // mapCredentialProviderError converts a FetchSecret failure into a
 // client-facing ext_proc denial, mirroring mapEgressIdentityError: a credential
@@ -48,40 +57,43 @@ func mapCredentialProviderError(err error) error {
 	}
 }
 
+// mapActorJWTError converts an actor JWT mint failure into a client-facing
+// ext_proc denial. An actor that was deleted (NotFound) denies as 403, a
+// transient control-plane failure as a retryable 503, and anything else, a
+// gateway or policy misconfiguration that retrying cannot fix, as 500.
+func mapActorJWTError(err error) error {
+	switch status.Code(err) {
+	case codes.NotFound:
+		return extproc.WrapReqError(envoy_type.StatusCode_Forbidden, err, deniedBody)
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return extproc.WrapReqError(envoy_type.StatusCode_ServiceUnavailable, err, deniedBody)
+	default:
+		return extproc.WrapReqError(envoy_type.StatusCode_InternalServerError, err, deniedBody)
+	}
+}
+
 // applyEffects resolves a matched rule's credential injections and returns the
-// header mutations to add to the request, or an error that denies it. A rule
-// with no injections adds nothing.
+// header mutations to add to the request, or an error that denies it. Only a
+// header the request carries is replaced (headers is keyed by lowercased
+// name); a request without it goes out unchanged, and its credential is not
+// fetched.
 //
-// A credential is only ever injected on the TLS-terminated MITM leg with a
-// credential provider configured. When injection cannot be performed — a
-// cleartext request, or no provider configured — it is skipped and the request
-// is let through without the credential rather than denied.
-//
-// Once injection is actually attempted (TLS leg, provider present), any failure
-// to produce the credential the policy required fails closed.
-func (h *Handler) applyEffects(ctx context.Context, ref resources.ActorRef, dest egresspolicy.Destination, leg string, effects *ateapipb.EgressRuleEffects) ([]*corev3.HeaderValueOption, error) {
-	injections := effects.GetInjectStaticHeaders()
+// Any failure to produce a credential the request needs denies it, including
+// having no provider configured for a credential_uri entry. Actor JWTs need no
+// provider.
+func (h *Handler) applyEffects(ctx context.Context, ref resources.ActorRef, dest egresspolicy.Destination, headers map[string]string, effects *ateapi.HttpRuleEffects) ([]*corev3.HeaderValueOption, error) {
+	var injections []*ateapi.CredentialHeader
+	for _, inj := range effects.GetReplaceHeaders() {
+		if _, ok := headers[strings.ToLower(inj.GetHeader())]; ok {
+			injections = append(injections, inj)
+		}
+	}
 	if len(injections) == 0 {
 		return nil, nil
 	}
 
-	if leg != extproc.EgressTLSMITMFilterChainName {
-		slog.WarnContext(ctx, "egress: skipping credential injection on a non-TLS leg; the request proceeds without the credential",
-			slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("leg", leg))
-		return nil, nil
-	}
-	if h.provider == nil {
-		slog.WarnContext(ctx, "egress: skipping credential injection because no credential provider is configured; the request proceeds without the credential",
-			slog.Any("actor", ref), slog.String("host", dest.Hostname))
-		return nil, nil
-	}
-
-	// The actor identity the provider authorizes on, as the actor's SPIFFE URI —
-	// the same form the CONNECT leg verified and shared as filter state. The
-	// provider authenticates this gateway and trusts its assertion; see
-	// pkg/proto/credproviderpb.
-	actorSpiffeID := resources.ActorSPIFFEID(ref).String()
-
+	ctx, cancel := context.WithTimeout(ctx, injectionTimeout)
+	defer cancel()
 	setHeaders := make([]*corev3.HeaderValueOption, 0, len(injections))
 	for _, inj := range injections {
 		if err := validateInjectHeader(inj.GetHeader()); err != nil {
@@ -90,41 +102,18 @@ func (h *Handler) applyEffects(ctx context.Context, ref resources.ActorRef, dest
 			return nil, extproc.WrapReqError(envoy_type.StatusCode_InternalServerError, err, deniedBody)
 		}
 
-		// Confirm the credential URI names the provider this gateway serves
-		// before dialing: the configured connection fronts one provider, so a URI
-		// naming another cannot be resolved here and must fail closed rather than
-		// be sent to the wrong provider.
-		if h.providerName != "" {
-			name, err := providerNameFromURI(inj.GetCredentialUri())
+		var secret []byte
+		var err error
+		if src := inj.GetActorJwt(); src != nil {
+			secret, err = h.actorJWT(ctx, ref, dest, src)
 			if err != nil {
-				slog.ErrorContext(ctx, "egress denied: policy names an unparseable credential URI",
-					slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("uri", inj.GetCredentialUri()), slog.Any("err", err))
-				return nil, extproc.WrapReqError(envoy_type.StatusCode_InternalServerError, err, deniedBody)
+				return nil, fmt.Errorf("minting an actor JWT for header %s: %w", inj.GetHeader(), err)
 			}
-			if name != h.providerName {
-				slog.ErrorContext(ctx, "egress denied: credential URI names a provider this gateway does not serve",
-					slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("uri", inj.GetCredentialUri()),
-					slog.String("provider", name), slog.String("serves", h.providerName))
-				return nil, extproc.NewReqError(envoy_type.StatusCode_InternalServerError, deniedBody)
+		} else {
+			secret, err = h.providerCredential(ctx, ref, dest, inj.GetCredentialUri())
+			if err != nil {
+				return nil, fmt.Errorf("fetching credential %s for header %s: %w", inj.GetCredentialUri(), inj.GetHeader(), err)
 			}
-		}
-
-		resp, err := h.provider.FetchSecret(ctx, &credproviderpb.FetchSecretRequest{
-			Uri:           inj.GetCredentialUri(),
-			ActorSpiffeId: actorSpiffeID,
-		})
-		if err != nil {
-			// Fail closed: a credential the policy required but we could not fetch
-			// must not let the request out without it.
-			slog.ErrorContext(ctx, "egress denied: credential fetch failed",
-				slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("uri", inj.GetCredentialUri()), slog.Any("err", err))
-			return nil, mapCredentialProviderError(err)
-		}
-		secret, err := sanitizeSecret(resp.GetOpaqueBytes())
-		if err != nil {
-			slog.ErrorContext(ctx, "egress denied: unusable credential",
-				slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("uri", inj.GetCredentialUri()), slog.Any("err", err))
-			return nil, extproc.WrapReqError(envoy_type.StatusCode_ServiceUnavailable, err, deniedBody)
 		}
 
 		// Overwrite any header the actor set itself, so a client cannot pre-seed a
@@ -135,4 +124,68 @@ func (h *Handler) applyEffects(ctx context.Context, ref resources.ActorRef, dest
 		})
 	}
 	return setHeaders, nil
+}
+
+// actorJWT mints the JWT src asks for. Every error it returns is already a
+// client-facing denial.
+func (h *Handler) actorJWT(ctx context.Context, ref resources.ActorRef, dest egresspolicy.Destination, src *ateapi.ActorJwtSource) ([]byte, error) {
+	jwt, err := h.actorJWTs.Token(ctx, ref, src)
+	if err != nil {
+		slog.ErrorContext(ctx, "egress denied: actor JWT mint failed",
+			slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.Any("audiences", src.GetAudiences()), slog.Any("err", err))
+		return nil, mapActorJWTError(err)
+	}
+	return []byte(jwt), nil
+}
+
+// providerCredential fetches the secret uri names from the credential
+// provider. Every error it returns is already a client-facing denial.
+func (h *Handler) providerCredential(ctx context.Context, ref resources.ActorRef, dest egresspolicy.Destination, uri string) ([]byte, error) {
+	if len(h.providers) == 0 {
+		slog.ErrorContext(ctx, "egress denied: policy requires credential injection but no credential provider is configured",
+			slog.Any("actor", ref), slog.String("host", dest.Hostname))
+		return nil, extproc.NewReqError(envoy_type.StatusCode_InternalServerError, deniedBody)
+	}
+
+	// When h.providers has exactly one entry and its key is "", that provider
+	// serves every URI. Otherwise look up the provider named by the URI's host,
+	// and fail closed if none matches.
+	var provider credprovider.CredentialProviderClient
+	if p, ok := h.providers[""]; ok && len(h.providers) == 1 {
+		provider = p
+	} else {
+		name, err := providerNameFromURI(uri)
+		if err != nil {
+			slog.ErrorContext(ctx, "egress denied: policy names an unparseable credential URI",
+				slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("uri", uri), slog.Any("err", err))
+			return nil, extproc.WrapReqError(envoy_type.StatusCode_InternalServerError, err, deniedBody)
+		}
+		if provider = h.providers[name]; provider == nil {
+			slog.ErrorContext(ctx, "egress denied: credential URI names a provider this gateway does not serve",
+				slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("uri", uri),
+				slog.String("provider", name), slog.Any("serves", slices.Sorted(maps.Keys(h.providers))))
+			return nil, extproc.NewReqError(envoy_type.StatusCode_InternalServerError, deniedBody)
+		}
+	}
+
+	// Atunnel connected to us with a worker-for-actor SPIFFE ID; translate it
+	// to a pure actor SPIFFE ID for plugins to make decisions on.
+	resp, err := provider.FetchSecret(ctx, &credprovider.FetchSecretRequest{
+		Uri:           uri,
+		ActorSpiffeId: resources.ActorSPIFFEID(ref).String(),
+	})
+	if err != nil {
+		// Fail closed: a credential the policy required but we could not fetch
+		// must not let the request out without it.
+		slog.ErrorContext(ctx, "egress denied: credential fetch failed",
+			slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("uri", uri), slog.Any("err", err))
+		return nil, mapCredentialProviderError(err)
+	}
+	secret, err := sanitizeSecret(resp.GetOpaqueBytes())
+	if err != nil {
+		slog.ErrorContext(ctx, "egress denied: unusable credential",
+			slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("uri", uri), slog.Any("err", err))
+		return nil, extproc.WrapReqError(envoy_type.StatusCode_ServiceUnavailable, err, deniedBody)
+	}
+	return secret, nil
 }

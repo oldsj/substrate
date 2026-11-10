@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,22 +14,11 @@
 
 package resources
 
-import "testing"
+import (
+	"testing"
 
-func TestActorSPIFFEIDRoundTrip(t *testing.T) {
-	ref := ActorRef{Atespace: "team-a", Name: "agent-7"}
-	id := ActorSPIFFEID(ref)
-	if want := "spiffe://substrate-actor.local/atespace/team-a/actor/agent-7"; id.String() != want {
-		t.Fatalf("ActorSPIFFEID(%v) = %q, want %q", ref, id, want)
-	}
-	got, err := ActorRefFromSPIFFEID(id.String())
-	if err != nil {
-		t.Fatalf("ActorRefFromSPIFFEID(%q): %v", id, err)
-	}
-	if got != ref {
-		t.Errorf("ActorRefFromSPIFFEID(%q) = %v, want %v", id, got, ref)
-	}
-}
+	"github.com/google/go-cmp/cmp"
+)
 
 func TestActorRefFromSPIFFEIDRejects(t *testing.T) {
 	for _, id := range []string{
@@ -50,8 +39,86 @@ func TestActorRefFromSPIFFEIDRejects(t *testing.T) {
 		"spiffe://substrate-actor.local/atespace/team/actor/agent/",
 		"spiffe://substrate-actor.local/atespace/te%2Fam/actor/agent",
 	} {
-		if ref, err := ActorRefFromSPIFFEID(id); err == nil {
+		if ref, err := ActorRefFromWorkerForActorSPIFFEID(id); err == nil {
 			t.Errorf("ActorRefFromSPIFFEID(%q) = %v, want error", id, ref)
 		}
+	}
+}
+
+func TestActorRoundtrip(t *testing.T) {
+	testCases := []struct {
+		uri     string
+		wantRef ActorRef
+	}{
+		{
+			uri: "spiffe://substrate-actor.local/actor/foo/bar",
+			wantRef: ActorRef{
+				Atespace: "foo",
+				Name:     "bar",
+			},
+		},
+		{
+			uri: "spiffe://substrate-actor.local/actor/fd6cab8c-17c8-4c9e-8893-28e28aff724b/045841a7-5dcb-47eb-a76f-6d8460bfe009",
+			wantRef: ActorRef{
+				Atespace: "fd6cab8c-17c8-4c9e-8893-28e28aff724b",
+				Name:     "045841a7-5dcb-47eb-a76f-6d8460bfe009",
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.uri, func(t *testing.T) {
+			ref, err := ActorRefFromActorSPIFFEID(tc.uri)
+			if err != nil {
+				t.Fatalf("Unexpected error parsing uri: %v", err)
+			}
+
+			if diff := cmp.Diff(ref, tc.wantRef); diff != "" {
+				t.Fatalf("Bad ref; diff (-got +want)\n%s", diff)
+			}
+
+			gotURI := ActorSPIFFEID(ref)
+			if diff := cmp.Diff(gotURI.String(), tc.uri); diff != "" {
+				t.Fatalf("URI didn't round-trip; diff (-got +want)\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestWorkerForActorRoundtrip(t *testing.T) {
+	testCases := []struct {
+		uri     string
+		wantRef ActorRef
+	}{
+		{
+			uri: "spiffe://substrate-actor.local/worker-for-actor/foo/bar",
+			wantRef: ActorRef{
+				Atespace: "foo",
+				Name:     "bar",
+			},
+		},
+		{
+			uri: "spiffe://substrate-actor.local/worker-for-actor/fd6cab8c-17c8-4c9e-8893-28e28aff724b/045841a7-5dcb-47eb-a76f-6d8460bfe009",
+			wantRef: ActorRef{
+				Atespace: "fd6cab8c-17c8-4c9e-8893-28e28aff724b",
+				Name:     "045841a7-5dcb-47eb-a76f-6d8460bfe009",
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.uri, func(t *testing.T) {
+			ref, err := ActorRefFromWorkerForActorSPIFFEID(tc.uri)
+			if err != nil {
+				t.Fatalf("Unexpected error parsing uri: %v", err)
+			}
+
+			if diff := cmp.Diff(ref, tc.wantRef); diff != "" {
+				t.Fatalf("Bad ref; diff (-got +want)\n%s", diff)
+			}
+
+			gotURI := WorkerForActorSPIFFEID(ref)
+			if diff := cmp.Diff(gotURI.String(), tc.uri); diff != "" {
+				t.Fatalf("URI didn't round-trip; diff (-got +want)\n%s", diff)
+			}
+		})
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,14 +49,14 @@ func TestProcessRequestHeadersDispatchesByMode(t *testing.T) {
 		wantStatus envoy_type.StatusCode // 0 means "expect success"
 	}{
 		{
-			name:       "both directions served, egress chain",
-			registered: []Direction{DirectionIngress, DirectionEgress},
+			name:       "egress-only instance serves egress traffic",
+			registered: []Direction{DirectionEgress},
 			chain:      EgressFilterChainName,
 			wantRan:    DirectionEgress,
 		},
 		{
-			name:       "both directions served, ingress chain",
-			registered: []Direction{DirectionIngress, DirectionEgress},
+			name:       "ingress-only instance serves ingress traffic",
+			registered: []Direction{DirectionIngress},
 			chain:      ingressHTTPListener,
 			wantRan:    DirectionIngress,
 		},

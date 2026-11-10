@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,4 @@ const (
 	// ResourceNameRegexPattern is the regular expression pattern for a valid
 	// Substrate resource name.
 	ResourceNameRegexPattern = `[a-z0-9]([-a-z0-9]*[a-z0-9])?`
-	// GoldenActorAtespace is the reserved system atespace that per-template golden
-	// actors live in.
-	GoldenActorAtespace = "ate-golden"
 )

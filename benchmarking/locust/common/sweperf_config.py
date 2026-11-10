@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,9 +23,9 @@ def add_sweperf_arguments(parser: LocustArgumentParser) -> None:
     parser.add_argument(
         "--sweperf-template",
         type=str,
-        default="swebench-astropy-7336",
+        default="sweperf-astropy-7336",
         env_var="LOCUST_SWEPERF_TEMPLATE",
-        help="ActorTemplate name for the sweperf workload (default: swebench-astropy-7336)",
+        help="ActorTemplate name for the sweperf workload (default: sweperf-astropy-7336)",
         include_in_web_ui=True,
     )
     parser.add_argument(
@@ -42,5 +42,13 @@ def add_sweperf_arguments(parser: LocustArgumentParser) -> None:
         default=4,
         env_var="LOCUST_SWEPERF_NUM_CYCLES",
         help="Number of suspend/resume cycles to partition the workload steps into (default: 4)",
+        include_in_web_ui=True,
+    )
+    parser.add_argument(
+        "--sweperf-poll-interval-ms",
+        type=int,
+        default=100,
+        env_var="LOCUST_SWEPERF_POLL_INTERVAL_MS",
+        help="Interval in ms between /status polls while a cycle's job runs (default: 100)",
         include_in_web_ui=True,
     )

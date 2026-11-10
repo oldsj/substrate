@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,16 +28,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/jackc/pgx/v5"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 	"google.golang.org/protobuf/proto"
 )
 
 // Outbox payload format: one event-type byte followed by the binary Worker proto.
 // The tag byte is read by other replicas during rolling deploys, so
 // store.WorkerEventType values must stay append-only stable and fit a byte.
-func marshalWorkerEvent(eventType store.WorkerEventType, worker *ateapipb.Worker) ([]byte, error) {
+func marshalWorkerEvent(eventType store.WorkerEventType, worker *ateapi.Worker) ([]byte, error) {
 	b, err := proto.Marshal(worker)
 	if err != nil {
 		return nil, fmt.Errorf("in proto.Marshal: %w", err)
@@ -58,7 +58,7 @@ func unmarshalWorkerEvent(payload []byte) (store.WorkerEvent, error) {
 	default:
 		return store.WorkerEvent{}, fmt.Errorf("unknown worker event type byte %d", payload[0])
 	}
-	worker := &ateapipb.Worker{}
+	worker := &ateapi.Worker{}
 	if err := unmarshalStored(payload[1:], worker); err != nil {
 		return store.WorkerEvent{}, fmt.Errorf("in unmarshalStored: %w", err)
 	}
@@ -76,7 +76,7 @@ func unmarshalWorkerEvent(payload []byte) (store.WorkerEvent, error) {
 // committed. The worker comes from fn rather than from the caller because an
 // update only knows what it wrote once its mutation has run inside the
 // transaction.
-func (p *Persistence) writeAndAppendEvent(ctx context.Context, eventType store.WorkerEventType, fn func(ctx context.Context, tx pgx.Tx) (*ateapipb.Worker, error)) (*ateapipb.Worker, error) {
+func (p *Persistence) writeAndAppendEvent(ctx context.Context, eventType store.WorkerEventType, fn func(ctx context.Context, tx pgx.Tx) (*ateapi.Worker, error)) (*ateapi.Worker, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("beginning transaction: %w", err)
@@ -119,15 +119,8 @@ const (
 	// Minimum time retention keeps outbox rows.
 	outboxRetentionAge = 15 * time.Minute
 
-	// Paces partition maintenance.
-	outboxMaintenanceInterval = time.Minute
-
 	// The outbox partition range width.
 	outboxPartitionInterval = 15 * time.Minute
-
-	// Bounds a maintenance pass to prevent indefinite hangs (e.g., from lock waits)
-	// which would permanently starve partition creation. Stalls abort and retry.
-	outboxMaintenancePassTimeout = 5 * time.Minute
 
 	// How many intervals ahead partitions are pre-created: creation must stall past
 	// lead-1 intervals before any write detours into the DEFAULT partition backstop.
@@ -148,24 +141,6 @@ func (p *Persistence) outboxNow(ctx context.Context) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("reading database clock: %w", err)
 	}
 	return now.UTC(), nil
-}
-
-// Maintains worker_outbox partitions on a fixed timer.
-func (p *Persistence) outboxMaintenance(ctx context.Context) {
-	ticker := time.NewTicker(outboxMaintenanceInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		passCtx, cancel := context.WithTimeout(ctx, outboxMaintenancePassTimeout)
-		if err := p.maintainWorkerOutboxPartitions(passCtx); err != nil && ctx.Err() == nil {
-			slog.WarnContext(ctx, "worker outbox maintenance failed", slog.Any("err", err))
-		}
-		cancel()
-	}
 }
 
 // Database-scoped advisory lock used to elect a single replica to run the retention transaction (drops + trim).
@@ -213,7 +188,7 @@ func (p *Persistence) maintainWorkerOutboxPartitions(ctx context.Context) error 
 // own elected transaction. Locks touched: DEFAULT child only — never the
 // parent (see maintainWorkerOutboxPartitions on deadlock ordering).
 func (p *Persistence) retireStrayedOutboxDefault(ctx context.Context) error {
-	tx, err := p.watchPool.Begin(ctx)
+	tx, err := p.ownerPool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning outbox stray-cleanup transaction: %w", err)
 	}
@@ -255,7 +230,7 @@ func (p *Persistence) retireStrayedOutboxDefault(ctx context.Context) error {
 // worker write's outbox append) plus the dropped children — never the
 // DEFAULT while waiting on the parent.
 func (p *Persistence) dropExpiredOutboxRetention(ctx context.Context, now time.Time) error {
-	tx, err := p.watchPool.Begin(ctx)
+	tx, err := p.ownerPool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning outbox retention transaction: %w", err)
 	}
@@ -313,7 +288,7 @@ func (p *Persistence) createWorkerOutboxPartitions(ctx context.Context, instants
 func isCheckViolation(err error) bool { return pgErrCode(err) == "23514" }
 
 func (p *Persistence) tryCreateWorkerOutboxPartitions(ctx context.Context, truncateStrays bool, instants ...time.Time) error {
-	tx, err := p.watchPool.Begin(ctx)
+	tx, err := p.ownerPool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning outbox partition transaction: %w", err)
 	}

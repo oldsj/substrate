@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 )
 
 const (
@@ -56,3 +57,15 @@ func Infof(format string, args ...any) {
 func Warnf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "Warning: "+format+"\n", args...)
 }
+
+// Elapsed prints how long an operation took, as "(label took 1.234s)", so
+// a slow install can be attributed to a step from its log alone. Use it as
+// `defer log.Elapsed(time.Now(), "ko resolve")`: the start time is captured
+// when the defer statement runs.
+func Elapsed(start time.Time, label string) {
+	fmt.Fprintf(out, "  (%s took %.3fs)\n", label, time.Since(start).Seconds())
+}
+
+// Writer is the destination progress output goes to, for callers that render
+// several lines themselves rather than one step at a time.
+func Writer() io.Writer { return out }

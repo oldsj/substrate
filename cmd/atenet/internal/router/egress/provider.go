@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This file connects the egress gateway to the credential provider it resolves
-// egress credential injections through: dialing it, reducing the configured
-// provider prefix to the provider name the handler enforces, and the small
+// This file connects the egress gateway to the credential providers it resolves
+// egress credential injections through: dialing them, validating the configured
+// provider names the handler routes on, and the small
 // validators the injection path shares. The gateway's atenet router wires
 // DialProvider and ProviderName in when it builds the egress handler (see
 // cmd/atenet/internal/router).
@@ -33,7 +33,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/agent-substrate/substrate/internal/ateapiauth"
+	"go.ate.dev/substrate/internal/ateapiauth"
 )
 
 // credentialURIScheme is the only scheme a credential URI may carry.
@@ -81,22 +81,23 @@ func DialProvider(ctx context.Context, cfg ProviderDialConfig) (*grpc.ClientConn
 	return grpc.NewClient(cfg.Address, append(dialOpts, statsOpt)...)
 }
 
-// ProviderName reduces a configured provider — a ate-secret:// prefix such
-// as ate-secret://k8s.io — to the provider name (the URI host) the
-// handler compares credential URIs against, so a URI naming another provider
-// fails closed. An empty input returns an empty name, which disables the check
+// ProviderName validates a configured provider name, such as k8s.io: the host
+// of the credential URIs the gateway serves. An empty name disables the check
 // (dev only).
 func ProviderName(name string) (string, error) {
 	if name == "" {
 		return "", nil
 	}
-	return providerNameFromURI(name)
+	if got, err := providerNameFromURI(credentialURIScheme + "://" + name); err != nil || got != name {
+		return "", fmt.Errorf("%q is not a provider name such as k8s.io", name)
+	}
+	return name, nil
 }
 
 // providerNameFromURI returns the provider name of a ate-secret:// URI —
 // the URI host, e.g. "k8s.io" in
 // ate-secret://k8s.io/default/<namespace>/<secret>/<key>. The gateway reads only the host,
-// to confirm a URI targets the provider it is configured to serve.
+// to pick the provider a URI targets.
 func providerNameFromURI(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {

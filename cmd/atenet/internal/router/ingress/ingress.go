@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,13 +34,12 @@ import (
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
-	"github.com/agent-substrate/substrate/internal/atenet"
-	"github.com/agent-substrate/substrate/internal/atunnel"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/atenet"
+	atunnelingress "go.ate.dev/substrate/internal/atunnel/ingress"
 )
 
 // defaultActorPort is the actor's port when a request names no other one.
@@ -55,6 +54,8 @@ const (
 	OriginalDstAddressKey = "local"
 	// OriginalDstPortKey is the actor's target port.
 	OriginalDstPortKey = "port"
+	// WorkerSPIFFEIDKey is the SPIFFE ID atunnel's certificate must carry.
+	WorkerSPIFFEIDKey = "worker_spiffe_id"
 )
 
 // Handler routes ingress requests to the worker hosting their actor.
@@ -63,7 +64,7 @@ type Handler struct {
 	parking *parkingLot
 }
 
-func New(apiClient ateapipb.ControlClient, parkCfg ParkedRequestConfig, parkMetrics *ParkingMetrics) *Handler {
+func New(apiClient ateapi.ControlClient, parkCfg ParkedRequestConfig, parkMetrics *ParkingMetrics) *Handler {
 	lot := newParkingLot(parkCfg, parkMetrics)
 	return &Handler{
 		resumer: NewActorResumer(apiClient, withParking(parkCfg), withParkingLot(lot)),
@@ -83,8 +84,8 @@ func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestM
 	// stream's metadata — the per-request traceparent arrives in the
 	// HTTP headers carried inside the ProcessingRequest payload. Extract
 	// from there so our span links to the gateway's ingress span.
-	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(md.Headers))
-	ctx, span := otel.Tracer(extproc.ServiceName).Start(ctx, "ExtProc.RequestHeaders")
+	ctx = otel.GetTextMapPropagator().Extract(ctx, md)
+	ctx, span := otel.Tracer(serviceName).Start(ctx, "ExtProc.RequestHeaders")
 	defer span.End()
 
 	actorRef, err := atenet.ParseTargetActor(routingValue(md, atenet.TargetActorHeader, extproc.TargetActorFilterStateAttribute))
@@ -101,7 +102,7 @@ func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestM
 		targetAuthority = md.Host
 	}
 	if _, portStr, err := net.SplitHostPort(targetAuthority); err == nil {
-		if p, ok := atunnel.ParsePort(portStr); ok {
+		if p, ok := atunnelingress.ParsePort(portStr); ok {
 			targetPort = p
 		}
 	}
@@ -120,13 +121,22 @@ func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestM
 		Resume:           string(resumeOutcome),
 	}
 
-	workerIP := actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp()
+	// The first IP is in the cluster's primary IP family.
+	// TODO: choose the IP family that matches the dataplane's own address.
+	assignment := actor.GetStatus().GetWorkerAssignment()
+	var workerIP string
+	if ips := assignment.GetWorkerPodIps(); len(ips) > 0 {
+		workerIP = ips[0]
+	}
+	workerSPIFFEID := assignment.GetWorkerSpiffeId()
 	slog.InfoContext(ctx, "ResumeActor result",
 		slog.Any("actor", actorRef),
 		slog.String("state", actor.GetStatus().GetState().String()),
-		slog.String("workerIP", workerIP))
+		slog.String("workerIP", workerIP),
+		slog.String("workerSPIFFEID", workerSPIFFEID))
 
-	if ip := net.ParseIP(workerIP); ip == nil {
+	// Without the SPIFFE ID, atunnel's identity can't be checked.
+	if ip := net.ParseIP(workerIP); ip == nil || workerSPIFFEID == "" {
 		return res, extproc.NewReqError(envoy_type.StatusCode_InternalServerError,
 			"actor %s routing failed", actorRef)
 	}
@@ -143,6 +153,7 @@ func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestM
 		OriginalDstMetadataKey: map[string]any{
 			OriginalDstAddressKey: targetAddr,
 			OriginalDstPortKey:    strconv.Itoa(targetPort),
+			WorkerSPIFFEIDKey:     workerSPIFFEID,
 		},
 	})
 	if err != nil {
@@ -172,8 +183,15 @@ func (h *Handler) HandleRequestHeaders(ctx context.Context, md *extproc.RequestM
 }
 
 func routingValue(md *extproc.RequestMetadata, header, attribute string) string {
-	if value := md.Header(header); value != "" {
+	if value := md.Attribute(attribute); value != "" && value != "-" {
 		return value
 	}
-	return md.Attribute(attribute)
+	// Requests reaching main_internal via a terminated CONNECT tunnel retain
+	// the tunnel's authority in ConnectAuthorityFilterStateAttribute. For such
+	// requests, the actor header must have arrived on the outer CONNECT request;
+	// inner tunneled headers are untrusted and must never be used for routing.
+	if md.Attribute(extproc.ConnectAuthorityFilterStateAttribute) != "" {
+		return ""
+	}
+	return md.Header(header)
 }

@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/go-cmp/cmp"
+	"go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -28,28 +28,28 @@ func TestPrintEgressPolicyTo(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	pinNow(t, now)
 
-	policy := &ateapipb.EgressPolicy{
-		Metadata: &ateapipb.ResourceMetadata{
+	policy := &ateapi.EgressPolicy{
+		Metadata: &ateapi.ResourceMetadata{
 			Atespace:   "team-a",
 			Name:       "default",
 			Uid:        "3f2b1c0e-8d5a-4b6e-9c1d-2a7e4f6b8c0d",
 			Version:    2,
 			CreateTime: timestamppb.New(now.Add(-5 * time.Minute)),
 		},
-		Rules: []*ateapipb.EgressRule{
-			{Hostnames: &ateapipb.HostnameRule{Patterns: []string{"api.example.com"}}},
-			{Cidrs: &ateapipb.CIDRRule{Cidrs: []string{"10.64.0.0/16"}}},
+		Rules: []*ateapi.EgressRule{
+			{Http: &ateapi.HttpRule{Hostnames: []string{"api.example.com"}}},
+			{Https: &ateapi.HttpsRule{Hostnames: []string{"www.example.com"}, Ports: &ateapi.Ports{Numbers: []int32{8443}}}},
 		},
 	}
-	empty := &ateapipb.EgressPolicy{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "default", Version: 1, CreateTime: timestamppb.New(now.Add(-30 * time.Second))},
+	empty := &ateapi.EgressPolicy{
+		Metadata: &ateapi.ResourceMetadata{Atespace: "team-a", Name: "default", Version: 1, CreateTime: timestamppb.New(now.Add(-30 * time.Second))},
 	}
 
 	tests := []struct {
 		name    string
 		format  string
 		actor   string
-		policy  *ateapipb.EgressPolicy
+		policy  *ateapi.EgressPolicy
 		want    string
 		wantErr bool
 	}{
@@ -65,12 +65,15 @@ func TestPrintEgressPolicyTo(t *testing.T) {
   uid: 3f2b1c0e-8d5a-4b6e-9c1d-2a7e4f6b8c0d
   version: "2"
 rules:
-- hostnames:
-    patterns:
+- http:
+    hostnames:
     - api.example.com
-- cidrs:
-    cidrs:
-    - 10.64.0.0/16
+- https:
+    hostnames:
+    - www.example.com
+    ports:
+      numbers:
+      - 8443
 `,
 		},
 		{
@@ -88,17 +91,22 @@ rules:
   },
   "rules": [
     {
-      "hostnames": {
-        "patterns": [
+      "http": {
+        "hostnames": [
           "api.example.com"
         ]
       }
     },
     {
-      "cidrs": {
-        "cidrs": [
-          "10.64.0.0/16"
-        ]
+      "https": {
+        "hostnames": [
+          "www.example.com"
+        ],
+        "ports": {
+          "numbers": [
+            8443
+          ]
+        }
       }
     }
   ]

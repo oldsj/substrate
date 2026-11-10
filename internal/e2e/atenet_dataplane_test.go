@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,20 +31,54 @@ func TestAtenetDataplaneEgressPolicyDenial(t *testing.T) {
 		if !CurrentAtenetDataplane().IsEgressPolicyDenied(http.StatusForbidden, "actor egress policy denied destination") {
 			t.Error("AgentGateway direct policy denial was not recognized")
 		}
+		if !CurrentAtenetDataplane().IsEgressPolicyDenied(http.StatusBadGateway, `{"error":"request failed: EOF"}`) {
+			t.Error("AgentGateway ClientHello refusal was not recognized")
+		}
 	})
 }
 
-func TestAtenetDataplaneTLSPassthroughEgressPolicy(t *testing.T) {
+func TestAtenetDataplaneParkingBudget(t *testing.T) {
+	for _, dataplane := range []string{"envoy", "agentgateway"} {
+		t.Run(dataplane, func(t *testing.T) {
+			t.Setenv(AtenetDataplaneEnv, dataplane)
+			d := CurrentAtenetDataplane()
+			if got := d.ParkingBudgetStatus(); got != http.StatusServiceUnavailable {
+				t.Errorf("parking budget status = %d, want 503", got)
+			}
+			if !d.IsRetryableParkingBudgetExhaustion(http.StatusServiceUnavailable, "no worker has room for the actor") {
+				t.Error("parking budget exhaustion was not recognized")
+			}
+			if d.IsRetryableParkingBudgetExhaustion(http.StatusGatewayTimeout, "request timed out") {
+				t.Error("transport timeout was recognized as parking budget exhaustion")
+			}
+		})
+	}
+}
+
+func TestAtenetDataplaneEgressConnectStats(t *testing.T) {
+	const before = `# TYPE envoy_http_downstream_cx_http2_total counter
+envoy_http_downstream_cx_http2_total{envoy_http_conn_manager_prefix="egress_connect"} 1
+envoy_http_downstream_rq_xx{envoy_response_code_class="2",envoy_http_conn_manager_prefix="egress_connect"} 2
+`
+	const after = `# TYPE envoy_http_downstream_cx_http2_total counter
+envoy_http_downstream_cx_http2_total{envoy_http_conn_manager_prefix="egress_connect"} 4
+envoy_http_downstream_rq_xx{envoy_response_code_class="2",envoy_http_conn_manager_prefix="egress_connect"} 252
+`
+
 	t.Run("envoy", func(t *testing.T) {
 		t.Setenv(AtenetDataplaneEnv, "")
-		if !CurrentAtenetDataplane().SupportsTLSPassthroughEgressPolicy() {
-			t.Error("Envoy TLS passthrough egress policy was not supported")
+		got := CurrentAtenetDataplane().EgressConnectStats(before, after)
+		want := EgressConnectStats{Connections: 3, Requests: 250}
+		if got != want {
+			t.Errorf("EgressConnectStats() = %+v, want %+v", got, want)
 		}
 	})
 	t.Run("agentgateway", func(t *testing.T) {
 		t.Setenv(AtenetDataplaneEnv, "agentgateway")
-		if CurrentAtenetDataplane().SupportsTLSPassthroughEgressPolicy() {
-			t.Error("AgentGateway TLS passthrough egress policy unexpectedly reported support")
+		got := CurrentAtenetDataplane().EgressConnectStats(before, after)
+		want := EgressConnectStats{Connections: -1, Requests: -1}
+		if got != want {
+			t.Errorf("EgressConnectStats() = %+v, want %+v", got, want)
 		}
 	})
 }

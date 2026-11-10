@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,10 @@ package steps
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/internal/apiconfig"
 )
 
 // trustBundleNames are the ClusterTrustBundles the podcertificate controller
@@ -26,10 +28,14 @@ import (
 var trustBundleNames = []string{
 	"podidentity.podcert.ate.dev:identity:primary-bundle",
 	"servicedns.podcert.ate.dev:identity:primary-bundle",
+	"postgres.podcert.ate.dev:identity:primary-bundle",
 }
 
-// EnsureAPIServerPrerequisites creates the secrets and config ate-api-server
-// needs, skipping anything already present.
+// EnsureAPIServerPrerequisites creates or reconciles the secrets and
+// ConfigMaps ate-api-server needs. Existing secrets are kept, PostgreSQL
+// settings are always reconciled, and the server and authentication
+// ConfigMaps are rewritten when missing, invalid, or explicitly overridden by
+// flags.
 func (e *Env) EnsureAPIServerPrerequisites(ctx context.Context) error {
 	log.Step("ensure_apiserver_prerequisites")
 
@@ -43,29 +49,79 @@ func (e *Env) EnsureAPIServerPrerequisites(ctx context.Context) error {
 	if err := e.ensureSecret(ctx, e.Namespace(), SecretActorIDCACerts, e.CreateActorIDCACertsSecret); err != nil {
 		return err
 	}
-	if err := e.ensureSecret(ctx, NamespacePodCert, SecretServiceDNSCA, e.CreatePodCertificateControllerCAs); err != nil {
-		return err
-	}
 	// Always reconcile the PostgreSQL connection settings, so that a changed
-	// ATE_API_POSTGRES_CONNECTION_STRING reaches an existing install.
+	// ATE_API_POSTGRES_READ_WRITE_CONNECTION_STRING reaches an existing install.
 	if err := e.CreateAPIServerEnvVars(ctx); err != nil {
 		return err
 	}
 
-	exists, err := e.Kube.ConfigMapExists(ctx, e.Namespace(), ConfigMapAPIAuthn)
-	if err != nil {
+	if err := e.ensureAPIConfig(ctx); err != nil {
 		return err
 	}
-	if !exists {
-		return e.CreateAPIAuthenticationConfig(ctx)
+
+	if err := e.ensureAPIAuthenticationConfig(ctx); err != nil {
+		return err
 	}
 	return nil
 }
 
-// EnsurePodCertificateCAs creates the podcertificate signer pools if either is
+// ensureAPIAuthenticationConfig writes the ate-api-server authentication config
+// when it is missing or when the stored configuration fails schema validation
+// (e.g. after an upgrade changes the config schema or a rollback leaves
+// unsupported fields). When an expected JWT issuer is set explicitly and the
+// existing config is valid, only the kubernetes provider entry is updated so
+// any additional JWT providers are preserved.
+func (e *Env) ensureAPIAuthenticationConfig(ctx context.Context) error {
+	var parsed *apiconfig.AuthenticationConfig
+	var update func(context.Context) error
+	if e.Cfg.ExpectedJWTIssuer != "" {
+		update = func(ctx context.Context) error {
+			setKubernetesJWTProvider(parsed, e.Cfg.ExpectedJWTIssuer)
+			return e.applyAPIAuthenticationConfig(ctx, parsed)
+		}
+	}
+	return e.ensureConfigMap(
+		ctx,
+		ConfigMapAPIAuthn,
+		"authentication.yaml",
+		"any custom jwtProviders or custom issuer were reset to cluster defaults",
+		func(b []byte) error {
+			var err error
+			parsed, err = apiconfig.ParseAuthenticationConfig(b)
+			return err
+		},
+		e.CreateAPIAuthenticationConfig,
+		update,
+	)
+}
+
+// ensureAPIConfig writes the ate-api-server config file when it is missing,
+// when a log level was asked for explicitly, or when the stored configuration
+// fails schema or log-level validation. Otherwise an existing config, possibly
+// edited by hand, is kept.
+func (e *Env) ensureAPIConfig(ctx context.Context) error {
+	var update func(context.Context) error
+	if e.Cfg.APILogLevel != "" {
+		update = e.CreateAPIConfig
+	}
+	return e.ensureConfigMap(
+		ctx,
+		ConfigMapAPIConfig,
+		"apiconfig.textproto",
+		"resetting to default configuration",
+		func(b []byte) error {
+			_, err := apiconfig.ParseTextProto(b)
+			return err
+		},
+		e.CreateAPIConfig,
+		update,
+	)
+}
+
+// EnsurePodCertificateCAs creates the podcertificate signer pools if any is
 // missing.
 func (e *Env) EnsurePodCertificateCAs(ctx context.Context) error {
-	for _, name := range []string{SecretServiceDNSCA, SecretPodIdentityCA} {
+	for _, name := range []string{SecretServiceDNSCA, SecretPodIdentityCA, SecretPostgresCA} {
 		exists, err := e.Kube.SecretExists(ctx, NamespacePodCert, name)
 		if err != nil {
 			return err
@@ -78,10 +134,53 @@ func (e *Env) EnsurePodCertificateCAs(ctx context.Context) error {
 }
 
 // WaitForPodCertificateTrustBundles blocks until the podcertificate controller
-// has published both identity bundles.
+// has published all signer bundles.
 func (e *Env) WaitForPodCertificateTrustBundles(ctx context.Context) error {
 	log.Infof("Waiting for podcertificate ClusterTrustBundles to be ready...")
-	return e.Kube.WaitClusterTrustBundles(ctx, trustBundleNames, e.Cfg.WaitTimeout(BootstrapTimeout))
+	err := e.Kube.WaitClusterTrustBundles(ctx, trustBundleNames, e.Cfg.WaitTimeout(TrustBundleTimeout))
+	if err != nil {
+		return fmt.Errorf("%w\n%s", err, trustBundleDiagnostics)
+	}
+	return nil
+}
+
+// trustBundleDiagnostics is appended to a trust bundle timeout. By this point
+// the controller's rollout has already succeeded, so a missing bundle points
+// at the controller running but not producing, and these are the places to
+// look.
+const trustBundleDiagnostics = `The podcertificate-controller pod is likely Ready but not producing bundles
+(missing CA-pool secret, crash-looping after first Ready, RBAC denial, or a
+name mismatch after an upgrade). Investigate with:
+  kubectl get clustertrustbundles -A
+  kubectl -n podcertificate-controller-system logs deploy/podcertificate-controller --tail=200
+  kubectl -n podcertificate-controller-system get pods,secrets,configmaps
+  kubectl -n podcertificate-controller-system get events --sort-by=.lastTimestamp | tail -20`
+
+// ensureConfigMap runs create when the named ConfigMap is absent or its data
+// under key fails validate. When the existing ConfigMap is valid, update is
+// run if non-nil.
+func (e *Env) ensureConfigMap(
+	ctx context.Context,
+	name, key, resetNote string,
+	validate func([]byte) error,
+	create func(context.Context) error,
+	update func(context.Context) error,
+) error {
+	cm, err := e.Kube.GetConfigMap(ctx, e.Namespace(), name)
+	if err != nil {
+		return err
+	}
+	if cm == nil {
+		return create(ctx)
+	}
+	if err := validate([]byte(cm.Data[key])); err != nil {
+		log.Warnf("Rewriting %s/%s: existing %s is invalid (%v); %s", e.Namespace(), name, key, err, resetNote)
+		return create(ctx)
+	}
+	if update != nil {
+		return update(ctx)
+	}
+	return nil
 }
 
 // ensureSecret runs create when the named Secret is absent.

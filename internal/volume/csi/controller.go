@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,4 +38,9 @@ func (c *Client) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 // ControllerUnpublishVolume detaches the volume from a node.
 func (c *Client) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
 	return c.controller.ControllerUnpublishVolume(ctx, req)
+}
+
+// ControllerGetCapabilities returns the capabilities supported by the controller service.
+func (c *Client) ControllerGetCapabilities(ctx context.Context, req *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
+	return c.controller.ControllerGetCapabilities(ctx, req)
 }

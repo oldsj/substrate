@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
-	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/resources"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
@@ -57,7 +56,7 @@ func resumeBackoff(interval time.Duration, factor, jitter float64) wait.Backoff 
 }
 
 // budgetExhaustedError marks a resume that was still blocked on a retryable
-// condition (e.g. "no free workers available") when the parking budget elapsed.
+// condition (e.g. no worker has room) when the parking budget elapsed.
 // It wraps the last retryable error, so the HTTP boundary still maps the
 // underlying gRPC status faithfully (503 with the capacity message), while the
 // parking metrics can report budget exhaustion as its own outcome.
@@ -77,7 +76,7 @@ const (
 )
 
 type resumeCallResult struct {
-	actor *ateapipb.Actor
+	actor *ateapi.Actor
 	// resumed is true if ResumeActor call executed a cold activation
 	// false if the actor was already running
 	resumed bool
@@ -90,7 +89,7 @@ type resumeCallResult struct {
 
 // ActorResumer coordinates safe, deduplicated resumption of actors.
 type ActorResumer struct {
-	apiClient ateapipb.ControlClient
+	apiClient ateapi.ControlClient
 
 	// mu guards flights, the per-actor registry of in-flight resumes.
 	mu sync.Mutex
@@ -103,9 +102,9 @@ type ActorResumer struct {
 	// never on the fast path (#1081). A nil lot admits everyone.
 	lot *parkingLot
 
-	// parkEnabled makes transient worker-pool saturation (FailedPrecondition)
-	// retryable, so a request is parked and retried until budget rather than
-	// failing immediately.
+	// parkEnabled makes ResourceExhausted and Unavailable retryable, so a
+	// request is parked and retried until budget rather than failing
+	// immediately.
 	parkEnabled bool
 	// budget bounds the total time a single resume operation retries before the
 	// underlying error is returned.
@@ -122,7 +121,7 @@ type ActorResumer struct {
 type resumerOption func(*ActorResumer)
 
 // withParking configures parking behavior from cfg. When parking is enabled,
-// ResourceExhausted ("no free workers available") becomes retryable and the
+// ResourceExhausted (no worker has room) becomes retryable and the
 // resume is retried, at cfg's retry cadence, for up to cfg's budget. When
 // disabled, the resumer applies fail-fast-on-capacity behavior.
 func withParking(cfg ParkedRequestConfig) resumerOption {
@@ -143,7 +142,7 @@ func withParkingLot(lot *parkingLot) resumerOption {
 	return func(r *ActorResumer) { r.lot = lot }
 }
 
-func NewActorResumer(apiClient ateapipb.ControlClient, opts ...resumerOption) *ActorResumer {
+func NewActorResumer(apiClient ateapi.ControlClient, opts ...resumerOption) *ActorResumer {
 	r := &ActorResumer{
 		apiClient: apiClient,
 		flights:   make(map[string]*resumeActorFlight),
@@ -159,20 +158,20 @@ func NewActorResumer(apiClient ateapipb.ControlClient, opts ...resumerOption) *A
 
 // retryable reports whether err warrants another resume attempt while the
 // request remains parked. A concurrent-resume conflict (Aborted) is always
-// retried. Transient pool saturation (ResourceExhausted, "no free workers
-// available") and transient control-plane unavailability (Unavailable, e.g. an
+// retried. Transient pool saturation (ResourceExhausted, no worker has room)
+// and transient control-plane unavailability (Unavailable, e.g. an
 // ateapi rolling restart) are retried only when parking is enabled, turning a
 // momentary condition into a bounded wait instead of an immediate failure — a
 // parked request should ride out a blip, not fail on it with budget remaining.
-// FailedPrecondition stays retryable too: it no longer carries saturation, but
-// it does cover states a concurrent operation can move the actor out of.
+// FailedPrecondition is not retried: ateapi refuses the resume for the
+// actor's current state, and the router does not wait for that state to change.
 // All other codes (NotFound, DeadlineExceeded, PermissionDenied, ...) are
 // returned to the caller so the HTTP boundary can map them with full fidelity.
 func (r *ActorResumer) retryable(err error) bool {
 	switch status.Code(err) {
 	case codes.Aborted:
 		return true
-	case codes.ResourceExhausted, codes.FailedPrecondition, codes.Unavailable:
+	case codes.ResourceExhausted, codes.Unavailable:
 		return r.parkEnabled
 	default:
 		return false
@@ -181,8 +180,8 @@ func (r *ActorResumer) retryable(err error) bool {
 
 // ResumeActor ensures the actor is running.
 // This method will block until the actor is resumed or error.
-func (r *ActorResumer) ResumeActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, ResumeOutcome, error) {
-	ctx, span := otel.Tracer(extproc.ServiceName).Start(ctx, "ResumeActor",
+func (r *ActorResumer) ResumeActor(ctx context.Context, actorRef resources.ActorRef) (*ateapi.Actor, ResumeOutcome, error) {
+	ctx, span := otel.Tracer(serviceName).Start(ctx, "ResumeActor",
 		trace.WithAttributes(ateattr.ActorRefAttributes(actorRef)...))
 	defer span.End()
 
@@ -221,12 +220,12 @@ func (r *ActorResumer) runFlight(f *resumeActorFlight, key string, actorRef reso
 
 	backoff := r.backoff
 
-	var resumeResp *ateapipb.ResumeActorResponse
+	var resumeResp *ateapi.ResumeActorResponse
 	var lastRetryErr error
 
 	err := wait.ExponentialBackoffWithContext(bgCtx, backoff, func(context.Context) (bool, error) {
 		var err error
-		resumeResp, err = r.apiClient.ResumeActor(attemptCtx, &ateapipb.ResumeActorRequest{
+		resumeResp, err = r.apiClient.ResumeActor(attemptCtx, &ateapi.ResumeActorRequest{
 			Actor: actorRef.ToObjectRef(),
 		})
 		if err == nil {
@@ -234,10 +233,13 @@ func (r *ActorResumer) runFlight(f *resumeActorFlight, key string, actorRef reso
 		}
 
 		if r.retryable(err) {
-			f.signalRetrying()
+			// A caller that is shed reads err to pick its outcome.
+			f.signalRetrying(err)
 			lastRetryErr = err // remember it in case the budget elapses
 			return false, nil  // park: retry until the budget elapses
 		}
+		// Keep the final error even if the retry budget has expired.
+		lastRetryErr = nil
 		return false, err
 	})
 
@@ -247,7 +249,7 @@ func (r *ActorResumer) runFlight(f *resumeActorFlight, key string, actorRef reso
 // flightResult classifies the retry loop's terminal state into the shared
 // result every caller attached to the flight receives. bgCtx is the flight's
 // budget context, consulted only for whether the budget expired.
-func flightResult(bgCtx context.Context, resumeResp *ateapipb.ResumeActorResponse, err, lastRetryErr error, reqID uint64) *resumeCallResult {
+func flightResult(bgCtx context.Context, resumeResp *ateapi.ResumeActorResponse, err, lastRetryErr error, reqID uint64) *resumeCallResult {
 	result := &resumeCallResult{leaderID: reqID}
 	switch {
 	case err == nil:
@@ -268,7 +270,7 @@ func flightResult(bgCtx context.Context, resumeResp *ateapipb.ResumeActorRespons
 // two-phase: while the flight is resolving the caller holds nothing; once the
 // flight is retrying (or already was), the caller must hold a parking-lot slot
 // to keep waiting and is shed with a 503 when the lot is full.
-func (r *ActorResumer) awaitFlight(ctx context.Context, f *resumeActorFlight, actorRef resources.ActorRef, reqID uint64) (*ateapipb.Actor, ResumeOutcome, error) {
+func (r *ActorResumer) awaitFlight(ctx context.Context, f *resumeActorFlight, actorRef resources.ActorRef, reqID uint64) (*ateapi.Actor, ResumeOutcome, error) {
 	select {
 	case <-ctx.Done():
 		// The caller's request context was canceled before the shared resume
@@ -292,9 +294,10 @@ func (r *ActorResumer) awaitFlight(ctx context.Context, f *resumeActorFlight, ac
 	default:
 	}
 
-	release, ok := r.enterLot(ctx)
+	retryErr := f.retryErr()
+	release, ok := r.enterLot(ctx, shedOutcome(retryErr))
 	if !ok {
-		return nil, ResumeOutcomeUnknown, parkingFullErr(actorRef.String())
+		return nil, ResumeOutcomeUnknown, parkingFullErr(actorRef.String(), retryErr)
 	}
 	var finalErr error
 	defer func() { release(parkOutcomeFor(finalErr)) }()
@@ -311,10 +314,11 @@ func (r *ActorResumer) awaitFlight(ctx context.Context, f *resumeActorFlight, ac
 }
 
 // enterLot admits the caller to the parking lot, treating a nil lot as
-// unbounded (no admission control).
-func (r *ActorResumer) enterLot(ctx context.Context) (func(parkOutcome), bool) {
+// unbounded (no admission control). shedOutcome labels the rejection if the
+// lot is full.
+func (r *ActorResumer) enterLot(ctx context.Context, shedOutcome string) (func(parkOutcome), bool) {
 	if r.lot == nil {
 		return func(parkOutcome) {}, true
 	}
-	return r.lot.enter(ctx)
+	return r.lot.enter(ctx, shedOutcome)
 }

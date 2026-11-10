@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/agent-substrate/substrate/pkg/proto/credproviderpb"
+	"go.ate.dev/substrate/api/credprovider/v1"
 )
 
 func TestGrants(t *testing.T) {
@@ -71,9 +71,9 @@ func statuszServer(t *testing.T) (*Server, string) {
 	}
 	srv := NewServer(fake.NewSimpleClientset(secret), authz)
 
-	if _, err := srv.FetchSecret(context.Background(), &credproviderpb.FetchSecretRequest{
+	if _, err := srv.FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
 		Uri:           "ate-secret://k8s.io/default/ns1/example-api/token",
-		ActorSpiffeId: "spiffe://substrate-actor.local/atespace/team-a/actor/my-actor",
+		ActorSpiffeId: "spiffe://substrate-actor.local/actor/team-a/my-actor",
 	}); err != nil {
 		t.Fatalf("FetchSecret: %v", err)
 	}

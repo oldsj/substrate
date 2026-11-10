@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,13 @@
 package ocispec
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/sizing"
 )
 
 func TestShapeGVisorGivesEachActorItsOwnCgroupLeaf(t *testing.T) {
@@ -28,8 +31,8 @@ func TestShapeGVisorGivesEachActorItsOwnCgroupLeaf(t *testing.T) {
 		return spec.Linux.CgroupsPath
 	}
 
-	first := shape("uid-a", PauseContainer)
-	second := shape("uid-b", PauseContainer)
+	first := shape("uid-a", SandboxID)
+	second := shape("uid-b", SandboxID)
 	if first == second {
 		t.Errorf("two actors share the cgroup leaf %q", first)
 	}
@@ -41,45 +44,85 @@ func TestShapeGVisorGivesEachActorItsOwnCgroupLeaf(t *testing.T) {
 		t.Errorf("cgroupsPath %q contains a colon", first)
 	}
 
-	if a, b := shape("uid-a", PauseContainer), shape("uid-a", "app"); a == b {
+	if a, b := shape("uid-a", SandboxID), shape("uid-a", "app"); a == b {
 		t.Errorf("two containers of one actor share the leaf %q", a)
 	}
 }
 
 func TestGVisorCgroupLeafMatchesTheShapedPath(t *testing.T) {
 	spec := &specs.Spec{}
-	ShapeGVisor(spec, GVisorOptions{ActorUID: "uid-a", ContainerName: PauseContainer})
-	if want := "/" + GVisorCgroupLeaf("uid-a", PauseContainer); spec.Linux.CgroupsPath != want {
+	ShapeGVisor(spec, GVisorOptions{ActorUID: "uid-a", ContainerName: SandboxID})
+	if want := "/" + GVisorCgroupLeaf("uid-a", SandboxID); spec.Linux.CgroupsPath != want {
 		t.Errorf("shaped cgroupsPath = %q, want %q", spec.Linux.CgroupsPath, want)
 	}
 }
 
-func TestShapeGVisorBindsTheNamedResolvConf(t *testing.T) {
+// runsc replaces /dev and /dev/pts with its own mounts and ignores mqueue
+// mounts and the strictatime option, so ShapeGVisor drops them. nodev stays.
+// /tmp is capped at half the memory limit when tmpfs.
+func TestShapeGVisor_SystemMounts(t *testing.T) {
+	const durableDir = "/node/actors/a/durable-dir"
 	for _, tc := range []struct {
-		name       string
-		resolvConf string
-		wantSource string
+		name     string
+		memory   int64
+		mounts   []*ateworkerpb.VolumeMount
+		wantAll  []specs.Mount
+		wantEach []specs.Mount
 	}{
-		{name: "default is the worker pod's", wantSource: "/etc/resolv.conf"},
 		{
-			name:       "a sandbox may name its own",
-			resolvConf: "/var/lib/ateom-gvisor/actors/a/resolv.conf",
-			wantSource: "/var/lib/ateom-gvisor/actors/a/resolv.conf",
+			name:   "memory limit",
+			memory: 512 << 20,
+			wantAll: []specs.Mount{
+				{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+				{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+				{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+				{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", "size=268435456"}},
+			},
+		},
+		{
+			name:   "minimum positive memory limit",
+			memory: 1,
+			wantEach: []specs.Mount{
+				{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", "size=1"}},
+			},
+		},
+		{
+			name:   "no memory limit",
+			memory: 0,
+			wantEach: []specs.Mount{
+				{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777"}},
+			},
+		},
+		{
+			name:   "volumes at /dev/mqueue and /tmp",
+			memory: 512 << 20,
+			mounts: []*ateworkerpb.VolumeMount{
+				{Name: "mq", MountPath: "/dev/mqueue"},
+				{Name: "tmp", MountPath: "/tmp"},
+			},
+			wantEach: []specs.Mount{
+				{Destination: "/dev/mqueue", Type: "bind", Source: durableDir + "/mq", Options: []string{"bind", "rw", "nodev"}},
+				{Destination: "/tmp", Type: "bind", Source: durableDir + "/tmp", Options: []string{"bind", "rw", "nodev"}},
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			spec := &specs.Spec{}
-			ShapeGVisor(spec, GVisorOptions{
-				ActorUID: "a", ContainerName: "app", ResolvConf: tc.resolvConf,
+			actorDirs := &ateworkerpb.ActorDirs{DurableDirVolumeMountsDir: durableDir}
+			spec := Build(Options{
+				ActorDirs: actorDirs,
+				Container: &ateworkerpb.Container{
+					ContainerSpec:          &ateworkerpb.ContainerSpec{Args: []string{"/app"}},
+					DurableDirVolumeMounts: tc.mounts,
+				},
 			})
-			var got string
-			for _, m := range spec.Mounts {
-				if m.Destination == "/etc/resolv.conf" {
-					got = m.Source
-				}
+			ShapeGVisor(spec, GVisorOptions{ActorUID: "uid-a", ActorDirs: actorDirs, ContainerName: "app", Size: sizing.SandboxSize{MemoryBytes: tc.memory}})
+			if tc.wantAll != nil && !reflect.DeepEqual(spec.Mounts, tc.wantAll) {
+				t.Errorf("Mounts =\n%+v\nwant\n%+v", spec.Mounts, tc.wantAll)
 			}
-			if got != tc.wantSource {
-				t.Errorf("resolv.conf bound from %q, want %q", got, tc.wantSource)
+			for _, want := range tc.wantEach {
+				if got := mountFor(t, spec, want.Destination); !reflect.DeepEqual(got, want) {
+					t.Errorf("%s =\n%+v\nwant\n%+v", want.Destination, got, want)
+				}
 			}
 		})
 	}

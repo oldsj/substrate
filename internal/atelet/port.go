@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,5 +16,7 @@ package atelet
 
 const (
 	// DefaultPort is the port atelet's gRPC server listens on.
-	DefaultPort = 8085
+	// It is also atelet's hostPort, so it is chosen to avoid common node ports,
+	// the NodePort range, and the ephemeral range.
+	DefaultPort = 21998
 )

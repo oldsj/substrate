@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,29 +28,36 @@ import (
 	"strings"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/boomerutil"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/dynconfig"
-	bmetrics "github.com/agent-substrate/substrate/internal/benchmarking/boomer/metrics"
-	btrace "github.com/agent-substrate/substrate/internal/benchmarking/boomer/trace"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/userclass"
 	"github.com/myzhan/boomer"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/boomerutil"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/dynconfig"
+	bmetrics "go.ate.dev/substrate/internal/benchmarking/boomer/metrics"
+	btrace "go.ate.dev/substrate/internal/benchmarking/boomer/trace"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/userclass"
 
 	// Register user classes via init():
-	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/glutton"
-	_ "github.com/agent-substrate/substrate/internal/benchmarking/boomer/sweperf"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/agentsession"
+	_ "go.ate.dev/substrate/internal/benchmarking/boomer/ateenv"
+	_ "go.ate.dev/substrate/internal/benchmarking/boomer/glutton"
+	_ "go.ate.dev/substrate/internal/benchmarking/boomer/resumepaused"
+	_ "go.ate.dev/substrate/internal/benchmarking/boomer/sweperf"
 )
 
 func main() {
 	var (
 		apiEndpoint             = flag.String("api-endpoint", "k8s:///api.ate-system.svc.cluster.local:443", "ateapi gRPC dial target.")
-		routerURL               = flag.String("router-url", "http://atenet-router.ate-system.svc.cluster.local", "atenet HTTP router base URL (no trailing slash).")
+		routerURL               = flag.String("router-url", boomerutil.DefaultRouterURL, "atenet HTTPS router base URL (no trailing slash).")
 		atespace                = flag.String("atespace", "benchmark", "Atespace every actor this worker creates lives in. Ensured (CreateAtespace, AlreadyExists is ok) at startup.")
 		promAddr                = flag.String("prometheus-addr", ":8001", "Address for the Prometheus /metrics endpoint.")
-		configJSON              = flag.String("config-json", "", "Initial dynconfig as a JSON object (keys: trace_probability, min_wait_time, max_wait_time, min_live_time, max_live_time in seconds, durdir_file_size_bytes, resume_mode, lifecycle_mode, durdir_read_mode, durdir_template, mem_target, mem_churn, mem_read, max_pings_per_wake). Unset fields keep their built-in defaults.")
+		configJSON              = flag.String("config-json", "", "Initial dynconfig as a JSON object keyed by locust flag name in snake_case (trace_probability, min_wait_time, ...); the selected user class reads the keys it documents and ignores the rest. Unset keys keep the class's built-in defaults. Each payload the master serves later stands on its own in the same way, so a key it leaves null is back at the default.")
 		masterWebPort           = flag.Int("master-web-port", 0, "If non-zero, fetch dynconfig from http://{master-host}:{master-web-port}/boomer-config on each spawn message. Exits if the first fetch fails; later failures keep the last fetched values. {master-host} comes from boomer's existing --master-host flag.")
 		configPollInterval      = flag.Duration("config-poll-interval", 10*time.Second, "With --master-web-port, also fetch dynconfig on this interval. A spawn message comes only when the number of users or the spawn rate changes, thus a load shape that changes the sample rate alone needs this. Zero stops the polling.")
 		userClass               = flag.String("user-class", "glutton", fmt.Sprintf("Locust user class to run, lowercase; one of %s.", strings.Join(userclass.Names(), "|")))
 		actorsPerUser           = flag.Int("actors-per-user", 1, "Number of actors each user (VU) creates and cycles through in round-robin: on iteration i, the user targets actor i%actors-per-user. Startup creates all actors; shutdown hibernates+deletes them.")
+		checkAgentSessionScript = flag.String("check-agentsession-script", "", "Validate this agent-session script YAML and exit; nothing else runs. Used by benchmarking/locust/deploy.sh before uploading a script.")
+		totalActors             = flag.Int("total-actors", 100, "Total actors to create in the batch (spawn benchmark).")
+		spawnConcurrency        = flag.Int("spawn-concurrency", 1, "Number of actors created concurrently (spawn benchmark).")
+		actorDeadline           = flag.Float64("actor-deadline", 120, "Per-actor timeout in seconds covering CreateActor + ResumeActor + Ping (spawn benchmark).")
 		httpMaxIdleConnsPerHost = flag.Int("http-max-idle-conns-per-host", 10000, "Idle HTTP connections the router client keeps per host. Set it to at least the number of users this worker runs, so each VU reuses its connection to the router across wakes instead of opening a new one per request.")
 	)
 	// boomer.Run will call flag.Parse() if we haven't yet; calling here so
@@ -65,19 +72,65 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-
-	initialCfg, err := dynconfig.Parse([]byte(*configJSON), dynconfig.Config{
-		MaxWait:         500 * time.Millisecond,
-		MaxPingsPerWake: 1,
-	})
-	if err != nil {
-		slog.Error("failed to parse --config-json", slog.String("err", err.Error()))
+	if *totalActors < 1 {
+		slog.Error("fatal: --total-actors must be >= 1",
+			slog.Int("total_actors", *totalActors))
 		os.Exit(1)
 	}
 
+	if *spawnConcurrency < 1 {
+		slog.Error("fatal: --spawn-concurrency must be >= 1",
+			slog.Int("spawn_concurrency", *spawnConcurrency))
+		os.Exit(1)
+	}
+
+	if *actorDeadline <= 0 {
+		slog.Error("fatal: --actor-deadline must be > 0",
+			slog.Float64("actor_deadline", *actorDeadline))
+		os.Exit(1)
+	}
+
+	if !strings.HasPrefix(*routerURL, "https://") {
+		slog.Error("fatal: --router-url must use https://",
+			slog.String("router_url", *routerURL))
+		os.Exit(1)
+	}
+
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
+	if *checkAgentSessionScript != "" {
+		s, err := agentsession.LoadFile(*checkAgentSessionScript)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		b := agentsession.Budgets(s.Steps)
+		fmt.Printf("agent-session script %q: %d steps, declares %s RAM + %s disk, min_actor_memory %s\n",
+			s.Name, len(s.Steps), agentsession.FormatSize(b.RAM), agentsession.FormatSize(b.Disk), agentsession.FormatSize(s.MinActorMemory))
+		return
+	}
+
+	entry, ok := userclass.Lookup(class)
+	if !ok {
+		slog.Error("fatal: unknown --user-class value",
+			slog.String("user_class", *userClass),
+			slog.String("known", strings.Join(userclass.Names(), ",")))
+		os.Exit(1)
+	}
+
+	// The holder is built from the class's own codec, so a --config-json
+	// the class cannot run on fails here, and a bad value from the master
+	// later is refused in favor of the last good config.
+	dyn := dynconfig.NewHolder(entry.Config)
+	if *configJSON != "" {
+		if _, _, err := dyn.Apply([]byte(*configJSON)); err != nil {
+			slog.Error("failed to parse --config-json", slog.String("err", err.Error()))
+			os.Exit(1)
+		}
+	}
+
 	ctx := context.Background()
-	sampler := btrace.NewUpdatableSampler(initialCfg.TraceProbability)
+	sampler := btrace.NewUpdatableSampler(dyn.Common().TraceProbability)
 	tp, err := btrace.Init(ctx, "substrate-boomer", sampler)
 	if err != nil {
 		slog.Error("failed to initialize tracing", slog.String("err", err.Error()))
@@ -96,6 +149,12 @@ func main() {
 	}
 	defer conn.Close()
 
+	routerTLS, err := boomerutil.RouterTLSConfig()
+	if err != nil {
+		slog.Error("failed to configure router TLS", slog.String("err", err.Error()))
+		os.Exit(1)
+	}
+
 	// Every VU talks to the one router address, so the transport must keep
 	// as many idle connections as there are VUs. The default keeps two per
 	// host; at thousands of VUs each request then opens and closes its own
@@ -104,12 +163,12 @@ func main() {
 	// outlast a VU's gap between requests, which is the wake window plus the
 	// suspend/resume round trip.
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConns = 0 // no total cap; the per-host cap governs
+	transport.TLSClientConfig = routerTLS
+	transport.ForceAttemptHTTP2 = false // keep one HTTP/1.1 connection per VU across Envoy threads
+	transport.MaxIdleConns = 0          // no total cap; the per-host cap governs
 	transport.MaxIdleConnsPerHost = *httpMaxIdleConnsPerHost
 	transport.IdleConnTimeout = 5 * time.Minute
 	httpClient := &http.Client{Timeout: 30 * time.Second, Transport: transport}
-
-	dyn := dynconfig.NewHolder(initialCfg)
 
 	if *masterWebPort > 0 {
 		masterHost := flag.Lookup("master-host").Value.String()
@@ -149,21 +208,17 @@ func main() {
 	}
 
 	cfg := &userclass.Config{
-		APIStub:       apiStub,
-		HTTPClient:    httpClient,
-		RouterURL:     *routerURL,
-		Atespace:      *atespace,
-		Dyn:           dyn,
-		ActorsPerUser: *actorsPerUser,
+		APIStub:          apiStub,
+		HTTPClient:       httpClient,
+		RouterURL:        *routerURL,
+		Atespace:         *atespace,
+		Dyn:              dyn,
+		ActorsPerUser:    *actorsPerUser,
+		TotalActors:      *totalActors,
+		SpawnConcurrency: *spawnConcurrency,
+		ActorDeadline:    time.Duration(*actorDeadline * float64(time.Second)),
 	}
 
-	entry, ok := userclass.Lookup(class)
-	if !ok {
-		slog.Error("fatal: unknown --user-class value",
-			slog.String("user_class", *userClass),
-			slog.String("known", strings.Join(userclass.Names(), ",")))
-		os.Exit(1)
-	}
 	taskFn, shutdownFn := entry.Init(cfg)
 
 	slog.Info("registered boomer task",

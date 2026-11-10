@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/ateattr"
 )
 
 func TestClassifyOutcome(t *testing.T) {
@@ -73,7 +73,7 @@ func TestClassifyOutcome(t *testing.T) {
 		},
 		{
 			name:     "ResourceExhausted gRPC code maps to no_capacity",
-			err:      status.Error(codes.ResourceExhausted, "no free workers available"),
+			err:      status.Error(codes.ResourceExhausted, "no worker has room for the actor"),
 			expected: "no_capacity",
 		},
 		{
@@ -82,8 +82,18 @@ func TestClassifyOutcome(t *testing.T) {
 			expected: "not_found",
 		},
 		{
-			name:     "StatusCode_ServiceUnavailable ReqError maps to no_capacity",
-			err:      NewReqError(envoy_type.StatusCode_ServiceUnavailable, "no free workers"),
+			name:     "bare StatusCode_ServiceUnavailable ReqError maps to unavailable",
+			err:      NewReqError(envoy_type.StatusCode_ServiceUnavailable, "router at capacity"),
+			expected: "unavailable",
+		},
+		{
+			name:     "StatusCode_ServiceUnavailable ReqError with an uncoded cause maps to unavailable",
+			err:      WrapReqError(envoy_type.StatusCode_ServiceUnavailable, errors.New("policy lookup failed"), "egress unavailable"),
+			expected: "unavailable",
+		},
+		{
+			name:     "StatusCode_ServiceUnavailable ReqError wrapping ResourceExhausted maps to no_capacity",
+			err:      WrapReqError(envoy_type.StatusCode_ServiceUnavailable, status.Error(codes.ResourceExhausted, "no worker has room for the actor"), "actor unavailable"),
 			expected: "no_capacity",
 		},
 		{
@@ -92,8 +102,33 @@ func TestClassifyOutcome(t *testing.T) {
 			expected: "rate_limited",
 		},
 		{
+			name:     "PermissionDenied gRPC code maps to denied",
+			err:      status.Error(codes.PermissionDenied, "access denied"),
+			expected: "denied",
+		},
+		{
+			name:     "StatusCode_Forbidden ReqError maps to denied",
+			err:      NewReqError(envoy_type.StatusCode_Forbidden, "egress denied"),
+			expected: "denied",
+		},
+		{
+			name:     "StatusCode_Forbidden ReqError with an uncoded cause maps to denied",
+			err:      WrapReqError(envoy_type.StatusCode_Forbidden, errors.New("invalid actor certificate"), "egress denied"),
+			expected: "denied",
+		},
+		{
 			name:     "Unknown error maps to resume_error",
 			err:      errors.New("internal storage glitch"),
+			expected: "resume_error",
+		},
+		{
+			name:     "Internal gRPC code maps to resume_error",
+			err:      status.Error(codes.Internal, "resume failed"),
+			expected: "resume_error",
+		},
+		{
+			name:     "StatusCode_InternalServerError ReqError maps to resume_error",
+			err:      NewReqError(envoy_type.StatusCode_InternalServerError, "resume failed"),
 			expected: "resume_error",
 		},
 	}
@@ -110,7 +145,7 @@ func TestClassifyOutcome(t *testing.T) {
 func TestRecordRouteDuration_Attributes(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	h, err := mp.Meter("atenet-router").Float64Histogram(routeDurationMetricName)
+	h, err := NewRouteDurationHistogram(mp.Meter("atenet-router"))
 	if err != nil {
 		t.Fatalf("failed to create histogram: %v", err)
 	}
@@ -144,7 +179,7 @@ func TestRecordRouteDuration_Attributes(t *testing.T) {
 func TestRecordRouteDuration_NormalizesEmptyTemplateDimensions(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	h, err := mp.Meter("atenet-router").Float64Histogram(routeDurationMetricName)
+	h, err := NewRouteDurationHistogram(mp.Meter("atenet-router"))
 	if err != nil {
 		t.Fatalf("failed to create histogram: %v", err)
 	}

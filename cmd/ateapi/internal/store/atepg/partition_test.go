@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,8 +26,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storecontract"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storecontract"
 )
 
 // TestActorsTablePartitionable exists to keep it possible to partition the
@@ -133,6 +133,7 @@ func runContractSuitePartitioned(t *testing.T, key string, tables []string, allo
 		}
 		t.Cleanup(p.Close)
 		clearAll(t, p)
+		setTestPolicyManager(t, p)
 		return p
 	})
 	// A table the suite never reads or writes goes unchecked, so a missing

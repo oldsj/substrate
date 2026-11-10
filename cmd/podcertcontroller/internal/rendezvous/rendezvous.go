@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,7 +44,9 @@ import (
 const labelKey = "rendezvous.ate.dev/application"
 
 var (
-	leaseDuration      = 15 * time.Second
+	// LeaseDuration is how long a replica's lease stays valid without renewal,
+	// and therefore the upper bound on how long a dead replica keeps its assignments.
+	LeaseDuration      = 15 * time.Second
 	leaseRenewalPeriod = 10 * time.Second
 )
 
@@ -170,7 +172,7 @@ func (h *Hasher) ensureLease(ctx context.Context) error {
 		},
 		Spec: coordinationv1.LeaseSpec{
 			HolderIdentity:       &h.replicaName,
-			LeaseDurationSeconds: ptr.To(int32(int64(leaseDuration) / 1_000_000_000)),
+			LeaseDurationSeconds: ptr.To(int32(int64(LeaseDuration) / 1_000_000_000)),
 			AcquireTime:          ptr.To(metav1.NewMicroTime(now)),
 			RenewTime:            ptr.To(metav1.NewMicroTime(now)),
 			LeaseTransitions:     ptr.To[int32](1),

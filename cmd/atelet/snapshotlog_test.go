@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,12 +18,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/resources"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -102,10 +106,10 @@ func TestSnapshotLogAttrsSeconds(t *testing.T) {
 		templateNamespace: testTemplateNamespace,
 		templateName:      testTemplateName,
 		kind:              ateattr.SnapshotKindLatest,
-		scope:             ateattr.SnapshotScopeFull,
+		fidelity:          ateattr.SnapshotFidelityMemory,
 		sandboxClass:      "gvisor",
 	}
-	attrs := snapshotLogAttrs(testAttribution(), op, restoreDurationMetric,
+	attrs := snapshotLogAttrs(testAttribution(), op, restoreDurationMetric, nil,
 		[]phase{
 			{ateattr.SnapshotPhaseDownload, 2500 * time.Millisecond},
 			{ateattr.SnapshotPhaseTotal, 3 * time.Second},
@@ -121,13 +125,14 @@ func TestSnapshotLogAttrs(t *testing.T) {
 		templateNamespace: testTemplateNamespace,
 		templateName:      testTemplateName,
 		kind:              ateattr.SnapshotKindLatest,
-		scope:             ateattr.SnapshotScopeFull,
+		fidelity:          ateattr.SnapshotFidelityMemory,
 		sandboxClass:      "gvisor",
 	}
 
 	tests := []struct {
 		name        string
 		op          snapshotOp
+		err         error
 		phases      []phase
 		wantStrings map[string]string
 		wantNumbers map[string]float64
@@ -142,7 +147,7 @@ func TestSnapshotLogAttrs(t *testing.T) {
 				{ateattr.SnapshotPhaseSandboxAssets, 10 * time.Millisecond},
 				{ateattr.SnapshotPhaseDownload, 310 * time.Millisecond},
 				{ateattr.SnapshotPhaseOCIUnpack, 50 * time.Millisecond},
-				{ateattr.SnapshotPhaseAteomRestore, 60 * time.Millisecond},
+				{ateattr.SnapshotPhaseWorkerRestore, 60 * time.Millisecond},
 				{ateattr.SnapshotPhaseTotal, 420 * time.Millisecond},
 			},
 			wantStrings: map[string]string{
@@ -152,7 +157,7 @@ func TestSnapshotLogAttrs(t *testing.T) {
 				"ate.template.atespace": testTemplateNamespace,
 				"ate.template.name":     testTemplateName,
 				"ate.snapshot.kind":     ateattr.SnapshotKindLatest,
-				"ate.snapshot.scope":    ateattr.SnapshotScopeFull,
+				"ate.snapshot.fidelity": ateattr.SnapshotFidelityMemory,
 				"ate.sandbox.class":     "gvisor",
 			},
 			wantNumbers: map[string]float64{
@@ -163,7 +168,52 @@ func TestSnapshotLogAttrs(t *testing.T) {
 			},
 			// The phase key names the one step a datapoint timed; this record has
 			// them all, so borrowing it here would give one key two meanings.
-			wantAbsent: []string{"ate.snapshot.phase", "actor", "total", "download"},
+			// Absent error.type is success, as on the instruments.
+			wantAbsent: []string{"ate.snapshot.phase", "actor", "total", "download", "error.type"},
+		},
+		{
+			name: "a failed restore keeps the phases it completed and is marked with the gRPC code",
+			op:   fullOp,
+			err:  status.Error(codes.DeadlineExceeded, "download timed out"),
+			phases: []phase{
+				{ateattr.SnapshotPhaseDownload, 30 * time.Second},
+				{ateattr.SnapshotPhaseTotal, 30 * time.Second},
+			},
+			wantStrings: map[string]string{
+				"error.type": "DeadlineExceeded",
+			},
+			wantNumbers: map[string]float64{
+				"ate.actor.restore.duration.download": 30,
+			},
+		},
+		{
+			name:   "a plain error is a bounded Unknown, not its message",
+			op:     fullOp,
+			err:    errors.New("disk on fire at /var/lib/ate"),
+			phases: []phase{{ateattr.SnapshotPhaseTotal, time.Second}},
+			wantStrings: map[string]string{
+				"error.type": "Unknown",
+			},
+		},
+		{
+			// atelet's own downloads and uploads fail with wrapped context
+			// errors, not status errors; a timeout must not read as Unknown.
+			name:   "a wrapped context deadline reports DeadlineExceeded",
+			op:     fullOp,
+			err:    fmt.Errorf("while downloading memory-ranges: %w", context.DeadlineExceeded),
+			phases: []phase{{ateattr.SnapshotPhaseTotal, 30 * time.Second}},
+			wantStrings: map[string]string{
+				"error.type": "DeadlineExceeded",
+			},
+		},
+		{
+			name:   "a wrapped context cancellation reports Canceled",
+			op:     fullOp,
+			err:    fmt.Errorf("while restoring: %w", context.Canceled),
+			phases: []phase{{ateattr.SnapshotPhaseTotal, time.Second}},
+			wantStrings: map[string]string{
+				"error.type": "Canceled",
+			},
 		},
 		{
 			name:   "a phase that never ran is absent, not zero",
@@ -179,7 +229,7 @@ func TestSnapshotLogAttrs(t *testing.T) {
 			op: snapshotOp{
 				templateNamespace: testTemplateNamespace,
 				templateName:      testTemplateName,
-				scope:             ateattr.SnapshotScopeFull,
+				fidelity:          ateattr.SnapshotFidelityMemory,
 			},
 			phases: []phase{{ateattr.SnapshotPhaseTotal, 700 * time.Millisecond}},
 			wantStrings: map[string]string{
@@ -195,7 +245,7 @@ func TestSnapshotLogAttrs(t *testing.T) {
 			op: snapshotOp{
 				templateNamespace: testTemplateNamespace,
 				templateName:      testTemplateName,
-				scope:             ateattr.SnapshotScopeFull,
+				fidelity:          ateattr.SnapshotFidelityMemory,
 				sandboxClass:      "../../etc/passwd",
 			},
 			phases: []phase{{ateattr.SnapshotPhaseTotal, time.Second}},
@@ -209,7 +259,7 @@ func TestSnapshotLogAttrs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			attrs := snapshotLogAttrs(testAttribution(), tt.op, restoreDurationMetric, tt.phases)
+			attrs := snapshotLogAttrs(testAttribution(), tt.op, restoreDurationMetric, tt.err, tt.phases)
 
 			// json.Unmarshal keeps the last of a repeated key, so a duplicate is
 			// invisible in the rendered record and has to be caught on the slice.

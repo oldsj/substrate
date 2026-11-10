@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,4 +38,9 @@ func (c *Client) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 // NodeUnpublishVolume unmounts the volume.
 func (c *Client) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	return c.node.NodeUnpublishVolume(ctx, req)
+}
+
+// NodeGetCapabilities returns the capabilities supported by the node service.
+func (c *Client) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+	return c.node.NodeGetCapabilities(ctx, req)
 }

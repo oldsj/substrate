@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,7 +62,6 @@ type dirFixup struct {
 // layers stay compatible.
 func resolveImplicitDirFixups(layers []string) ([]dirFixup, error) {
 	implicitAt := make([]map[string]bool, len(layers))
-	ownersAt := make([]map[string]ownedPath, len(layers))
 	union := map[string]bool{}
 	for i, layerDir := range layers {
 		meta, err := readWhiteouts(layerDir)
@@ -82,17 +81,6 @@ func resolveImplicitDirFixups(layers []string) ([]dirFixup, error) {
 			union[rel] = true
 		}
 		implicitAt[i] = set
-		owners := make(map[string]ownedPath, len(meta.Owners))
-		for _, owner := range meta.Owners {
-			rel, err := validateOwnedPath(owner.Path)
-			if err != nil {
-				return nil, fmt.Errorf("invalid ownership path in %q: %w", layerDir, err)
-			}
-			if owner.UID != 0 || owner.GID != 0 {
-				owners[rel] = owner
-			}
-		}
-		ownersAt[i] = owners
 	}
 	if len(union) == 0 {
 		return nil, nil
@@ -138,10 +126,7 @@ func resolveImplicitDirFixups(layers []string) ([]dirFixup, error) {
 				Path: p,
 				Mode: fi.Mode().Perm() | fi.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky),
 			}
-			if owner, ok := ownersAt[j][p]; ok {
-				f.Mode = fileModeFromTarBits(owner.Mode)
-				f.UID, f.GID, f.HasOwner = owner.UID, owner.GID, true
-			} else if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 				f.UID, f.GID, f.HasOwner = int(st.Uid), int(st.Gid), true
 			}
 			fixups = append(fixups, f)
@@ -176,15 +161,23 @@ func applyDirFixups(rootfsPath string, fixups []dirFixup) error {
 		if !fi.IsDir() {
 			continue
 		}
-		// Chown first: chown can clear setuid/setgid bits, so the chmod
-		// must come after it.
+		// Chmod clears setgid when the caller is not in the directory's group
+		// and lacks CAP_FSETID, as in the gVisor worker. A directory
+		// FinalizeLayer created can already have another group from a setgid
+		// parent, so give it the caller's group before the chmod. Chown keeps
+		// a directory's setgid and sticky bits.
 		if f.HasOwner {
-			if err := root.Chown(f.Path, f.UID, f.GID); err != nil {
-				return fmt.Errorf("while restoring owner of %q: %w", f.Path, err)
+			if err := root.Chown(f.Path, -1, os.Getegid()); err != nil {
+				return fmt.Errorf("while restoring mode of %q: %w", f.Path, err)
 			}
 		}
 		if err := root.Chmod(f.Path, f.Mode); err != nil {
 			return fmt.Errorf("while restoring mode of %q: %w", f.Path, err)
+		}
+		if f.HasOwner {
+			if err := root.Chown(f.Path, f.UID, f.GID); err != nil {
+				return fmt.Errorf("while restoring owner of %q: %w", f.Path, err)
+			}
 		}
 	}
 	return nil

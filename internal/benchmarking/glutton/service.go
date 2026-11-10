@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,13 +25,16 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	goruntime "runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	gluttonpb "github.com/agent-substrate/substrate/internal/proto/glutton"
+	gluttonpb "go.ate.dev/substrate/internal/proto/glutton"
 )
 
 // diskKeyRE rejects anything that could escape the data dir or hit a
@@ -42,6 +45,10 @@ type Service struct {
 	gluttonpb.UnimplementedGluttonServer
 
 	dataDir string
+	// syncWrites makes WriteDisk fsync each file before it returns.
+	syncWrites bool
+	// readyzDir, when set, is the directory /readyz must be able to write to.
+	readyzDir string
 
 	// TODO: split this into per-resource locks (ram, fds, peers). A single
 	// global mutex serializes unrelated operations across all three.
@@ -53,6 +60,8 @@ type Service struct {
 	fds       []*os.File
 	peers     map[string]*peerGossip
 
+	cpu cpuLoad
+
 	ramWriteBytes  metric.Int64Counter
 	ramReadBytes   metric.Int64Counter
 	diskWriteBytes metric.Int64Counter
@@ -62,15 +71,33 @@ type Service struct {
 	gossipLatency  metric.Float64Histogram
 }
 
+// Option configures a Service.
+type Option func(*Service)
+
+// WithSyncWrites makes WriteDisk fsync each file before it returns, so the
+// measured write includes the flush to the backing volume.
+func WithSyncWrites() Option {
+	return func(s *Service) { s.syncWrites = true }
+}
+
+// WithWritableReadyz makes /readyz fail until the data dir is writable, so
+// ResumeActor waits for an external volume mount before the actor takes load.
+func WithWritableReadyz() Option {
+	return func(s *Service) { s.readyzDir = s.dataDir }
+}
+
 // New constructs a Service storing WriteDisk files under dir and registers its
 // otel instruments. The caller is responsible for creating dir and for calling
 // Close to stop any running gossip goroutines.
-func New(dir string) (*Service, error) {
+func New(dir string, opts ...Option) (*Service, error) {
 	s := &Service{
 		dataDir:   dir,
 		ram:       make(map[string][]byte),
 		ramCursor: make(map[string]int),
 		peers:     make(map[string]*peerGossip),
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	if err := s.initMetrics(); err != nil {
 		return nil, err
@@ -78,7 +105,8 @@ func New(dir string) (*Service, error) {
 	return s, nil
 }
 
-// Close cancels every running gossip goroutine and waits for them to exit.
+// Close cancels every running gossip goroutine and waits for them to exit,
+// then tears down any running CPU load pool.
 func (s *Service) Close() {
 	s.mu.Lock()
 	peers := s.peers
@@ -88,6 +116,7 @@ func (s *Service) Close() {
 		p.cancel()
 		<-p.done
 	}
+	s.cpu.Stop()
 }
 
 // Write to RAM, either overwriting previously-used RAM or allocating additional RAM
@@ -239,6 +268,11 @@ func (s *Service) WriteDisk(ctx context.Context, req *gluttonpb.WriteDiskRequest
 	if err := streamRandomBytes(io.MultiWriter(f, h), size); err != nil {
 		return nil, status.Errorf(codes.Internal, "write %s: %v", path, err)
 	}
+	if s.syncWrites {
+		if err := f.Sync(); err != nil {
+			return nil, status.Errorf(codes.Internal, "sync %s: %v", path, err)
+		}
+	}
 
 	// OVERWRITE has no O_TRUNC, bytes from a larger, earlier write will persist.
 	// The cursor is already at size, so folding the remainder into the
@@ -332,6 +366,83 @@ func (s *Service) OpenFD(_ context.Context, req *gluttonpb.OpenFDRequest) (*glut
 func (s *Service) Ping(ctx context.Context, req *gluttonpb.PingRequest) (*gluttonpb.PingResponse, error) {
 	s.pingsReceived.Add(ctx, 1)
 	return &gluttonpb.PingResponse{Message: req.GetMessage()}, nil
+}
+
+// burnBlockBytes sizes the buffer each burner goroutine re-hashes; large
+// enough that hashing dominates loop overhead, small enough to stay in cache
+// so the burn is compute-bound rather than memory-bound.
+const burnBlockBytes = 64 << 10 // 64 KiB
+
+// BurnCPU spins the requested number of goroutines in a sha256 loop until
+// the wall-clock duration elapses. The iteration count in the response keeps
+// the work observable. Deliberately unsynchronized with s.mu: burning must
+// not block the other RPCs.
+func (s *Service) BurnCPU(ctx context.Context, req *gluttonpb.BurnCPURequest) (*gluttonpb.BurnCPUResponse, error) {
+	if req.GetDurationMs() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "duration_ms must be non-negative")
+	}
+	parallelism := int(req.GetParallelism())
+	if parallelism < 1 {
+		parallelism = 1
+	}
+	// Cap the goroutine count: past a few per CPU the burn gains nothing,
+	// and an uncapped value lets a single request spawn without bound.
+	if maxPar := goruntime.NumCPU() * 4; parallelism > maxPar {
+		parallelism = maxPar
+	}
+	deadline := time.Now().Add(time.Duration(req.GetDurationMs()) * time.Millisecond)
+
+	var total atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			block := make([]byte, burnBlockBytes)
+			var n int64
+			for time.Now().Before(deadline) && ctx.Err() == nil {
+				sum := sha256.Sum256(block)
+				copy(block, sum[:])
+				n++
+			}
+			total.Add(n)
+		}()
+	}
+	wg.Wait()
+	return &gluttonpb.BurnCPUResponse{Iterations: total.Load()}, nil
+}
+
+// Ingest writes the caller-supplied payload to a file under the data dir.
+// The payload crossed the network to get here, which is the point: WriteDisk
+// generates its bytes locally, Ingest models a download arriving through the
+// actor's ingress path before it hits disk.
+func (s *Service) Ingest(ctx context.Context, req *gluttonpb.IngestRequest) (*gluttonpb.IngestResponse, error) {
+	if !diskKeyRE.MatchString(req.GetKey()) {
+		return nil, status.Errorf(codes.InvalidArgument, "key %q must match %s", req.GetKey(), diskKeyRE)
+	}
+
+	path := filepath.Join(s.dataDir, req.GetKey())
+	flag := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if req.GetAppend() {
+		flag = os.O_WRONLY | os.O_CREATE | os.O_APPEND
+	}
+	f, err := os.OpenFile(path, flag, 0o600)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "open %s: %v", path, err)
+	}
+	defer f.Close()
+
+	if _, err := f.Write(req.GetPayload()); err != nil {
+		return nil, status.Errorf(codes.Internal, "write %s: %v", path, err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "stat %s: %v", path, err)
+	}
+
+	digest := sha256.Sum256(req.GetPayload())
+	s.diskWriteBytes.Add(ctx, int64(len(req.GetPayload())))
+	return &gluttonpb.IngestResponse{Size: info.Size(), Sha256: digest[:]}, nil
 }
 
 func randomBytes(n int) ([]byte, error) {

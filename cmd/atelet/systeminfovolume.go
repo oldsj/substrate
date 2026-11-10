@@ -1,4 +1,4 @@
-//  Copyright 2026 Google LLC
+//  Copyright 2026 The Agent Substrate Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -26,28 +26,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateompath"
-	"github.com/agent-substrate/substrate/internal/pemutil"
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/internal/volumepath"
-	certsv1beta1 "k8s.io/api/certificates/v1beta1"
+	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
+	"go.ate.dev/substrate/cmd/atelet/internal/trustbundle"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/volumepath"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/util/wait"
-	certlisters "k8s.io/client-go/listers/certificates/v1beta1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 )
-
-// systemInfoVolume is one system-info volume of an actor and its host root.
-type systemInfoVolume struct {
-	Name string
-	Root string
-	Spec *ateletpb.SystemInfoVolume
-
-	// appliedHashes maps each projected bundle name to the trustBundleHash
-	// last written into this volume.
-	appliedHashes map[string]string
-}
 
 // systemInfoVolumesFor lists spec's system-info volumes with their host roots.
 func systemInfoVolumesFor(actorUID string, spec *ateletpb.WorkloadSpec) []*systemInfoVolume {
@@ -56,7 +44,7 @@ func systemInfoVolumesFor(actorUID string, spec *ateletpb.WorkloadSpec) []*syste
 		if si := vol.GetSystemInfo(); si != nil {
 			volumes = append(volumes, &systemInfoVolume{
 				Name: vol.GetName(),
-				Root: ateompath.SystemInfoVolumeRoot(actorUID, vol.GetName()),
+				Root: ateletpath.SystemInfoVolumeRoot(actorUID, vol.GetName()),
 				Spec: si,
 			})
 		}
@@ -68,7 +56,7 @@ type registeredActor struct {
 	uid string
 	ref resources.ActorRef
 
-	// mu covers the volumes' file writes, appliedHashes, and stale.
+	// mu covers the volumes' file writes and stale.
 	mu      sync.Mutex
 	stale   bool
 	volumes []*systemInfoVolume
@@ -77,7 +65,7 @@ type registeredActor struct {
 // systemInfoVolumeRefresher writes system-info volumes when an actor starts
 // and refreshes them as needed.
 type systemInfoVolumeRefresher struct {
-	lister    certlisters.ClusterTrustBundleLister
+	bundles   *trustbundle.Source
 	hasSynced cache.InformerSynced
 
 	// queue carries bundle names from informer events to the run loop.
@@ -91,11 +79,11 @@ type systemInfoVolumeRefresher struct {
 }
 
 // newSystemInfoVolumeRefresher subscribes to ClusterTrustBundle events.
-func newSystemInfoVolumeRefresher(lister certlisters.ClusterTrustBundleLister, informer cache.SharedIndexInformer) *systemInfoVolumeRefresher {
+func newSystemInfoVolumeRefresher(bundles *trustbundle.Source, informer cache.SharedIndexInformer) *systemInfoVolumeRefresher {
 	r := &systemInfoVolumeRefresher{
-		lister: lister,
-		queue:  workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		actors: map[string]*registeredActor{},
+		bundles: bundles,
+		queue:   workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		actors:  map[string]*registeredActor{},
 	}
 	if informer != nil {
 		informer.AddEventHandler(r.eventHandler())
@@ -107,8 +95,9 @@ func newSystemInfoVolumeRefresher(lister certlisters.ClusterTrustBundleLister, i
 // Register records actorUID's system-info volumes and writes their contents
 // from current cluster state. If actorUID is already registered (for example
 // after a worker pod crash left a stale entry without Terminate), the previous
-// registration is superseded.
-func (r *systemInfoVolumeRefresher) Register(actorUID string, ref resources.ActorRef, volumes []*systemInfoVolume) error {
+// registration is superseded, even if this registration's initial write fails.
+// The failed registration is removed without restoring the previous one.
+func (r *systemInfoVolumeRefresher) Register(actorUID string, ref resources.ActorRef, volumes []*systemInfoVolume) (*registeredActor, error) {
 	actor := &registeredActor{uid: actorUID, ref: ref, volumes: volumes}
 	// Held until the initial write finishes so a refresh cannot interleave.
 	actor.mu.Lock()
@@ -129,10 +118,16 @@ func (r *systemInfoVolumeRefresher) Register(actorUID string, ref resources.Acto
 
 	for _, v := range volumes {
 		if err := r.write(ref, actorUID, v); err != nil {
-			return fmt.Errorf("while populating system-info volume %q: %w", v.Name, err)
+			r.mu.Lock()
+			if r.actors[actorUID] == actor {
+				delete(r.actors, actorUID)
+				actor.stale = true
+			}
+			r.mu.Unlock()
+			return nil, fmt.Errorf("while populating system-info volume %q: %w", v.Name, err)
 		}
 	}
-	return nil
+	return actor, nil
 }
 
 // Deregister drops actorUID's registration. After Deregister returns, no more
@@ -151,27 +146,39 @@ func (r *systemInfoVolumeRefresher) Deregister(actorUID string) {
 	}
 }
 
-// collectData builds the volume's contents keyed by volume-relative path,
-// plus each projected bundle's trustBundleHash.
-func (r *systemInfoVolumeRefresher) collectData(ref resources.ActorRef, actorUID string, si *ateletpb.SystemInfoVolume) (payload map[string][]byte, bundleHashes map[string]string, err error) {
+// DeregisterOwned removes owner only when its UID still points at it. This
+// protects a newer registration from cleanup belonging to an older operation.
+func (r *systemInfoVolumeRefresher) DeregisterOwned(owner *registeredActor) {
+	if owner == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.actors[owner.uid] != owner {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.actors, owner.uid)
+	r.mu.Unlock()
+
+	owner.mu.Lock()
+	owner.stale = true
+	owner.mu.Unlock()
+}
+
+// collectData builds the volume's contents keyed by volume-relative path.
+func (r *systemInfoVolumeRefresher) collectData(ref resources.ActorRef, actorUID string, si *ateletpb.SystemInfoVolumeSource) (payload map[string][]byte, err error) {
 	payload = map[string][]byte{}
-	bundleHashes = map[string]string{}
-	for _, dataSourceAny := range si.GetDataSources() {
-		switch dataSource := dataSourceAny.GetDataSource().(type) {
-		case *ateletpb.SystemInfoDataSource_TrustBundle:
-			tb := dataSource.TrustBundle
-			objectName, raw, err := rawTrustBundle(r.lister, tb.GetName())
+	for _, dataSource := range si.GetDataSources() {
+		switch {
+		case dataSource.GetTrustBundle() != nil:
+			tb := dataSource.GetTrustBundle()
+			pemBundle, err := r.bundles.Combined(tb.GetNames())
 			if err != nil {
-				return nil, nil, fmt.Errorf("system-info projection %q: %w", tb.GetPath(), err)
-			}
-			pemBundle, err := pemutil.SanitizeCertificateBundle([]byte(raw))
-			if err != nil {
-				return nil, nil, fmt.Errorf("system-info projection %q: unusable ClusterTrustBundle %q: %w", tb.GetPath(), objectName, err)
+				return nil, fmt.Errorf("system-info projection %q: %w", tb.GetPath(), err)
 			}
 			payload[tb.GetPath()] = pemBundle
-			bundleHashes[tb.GetName()] = trustBundleHash(raw)
-		case *ateletpb.SystemInfoDataSource_ActorMetadata:
-			for _, item := range dataSource.ActorMetadata.GetItems() {
+		case dataSource.GetActorMetadata() != nil:
+			for _, item := range dataSource.GetActorMetadata().GetItems() {
 				var value string
 				switch item.GetField() {
 				case ateletpb.ActorMetadataField_ACTOR_METADATA_FIELD_NAME:
@@ -189,54 +196,69 @@ func (r *systemInfoVolumeRefresher) collectData(ref resources.ActorRef, actorUID
 			}
 		}
 	}
-	return payload, bundleHashes, nil
+	return payload, nil
 }
 
 // write brings the volume's files up to date.
 func (r *systemInfoVolumeRefresher) write(ref resources.ActorRef, actorUID string, v *systemInfoVolume) error {
-	payload, bundleHashes, err := r.collectData(ref, actorUID, v.Spec)
+	payload, err := r.collectData(ref, actorUID, v.Spec)
 	if err != nil {
 		return fmt.Errorf("while collecting volume contents: %w", err)
 	}
+	_, err = v.apply(payload)
+	return err
+}
+
+// systemInfoVolume is one system-info volume of an actor and its host root.
+type systemInfoVolume struct {
+	Name string
+	Root string
+	Spec *ateletpb.SystemInfoVolumeSource
+}
+
+// apply writes payload into the volume and reports whether any file changed.
+func (v *systemInfoVolume) apply(payload map[string][]byte) (changed bool, err error) {
 	if err := os.MkdirAll(v.Root, 0o755); err != nil {
-		return fmt.Errorf("while creating %q: %w", v.Root, err)
+		return false, fmt.Errorf("while creating %q: %w", v.Root, err)
 	}
 	root, err := os.OpenRoot(v.Root)
 	if err != nil {
-		return fmt.Errorf("while opening %q: %w", v.Root, err)
+		return false, fmt.Errorf("while opening %q: %w", v.Root, err)
 	}
 	defer root.Close()
 	for _, relPath := range slices.Sorted(maps.Keys(payload)) {
-		if err := writeSystemInfoFile(root, relPath, payload[relPath]); err != nil {
-			return err
+		written, err := writeSystemInfoFile(root, relPath, payload[relPath])
+		if err != nil {
+			return changed, err
 		}
+		changed = changed || written
 	}
-	v.appliedHashes = bundleHashes
-	return nil
+	return changed, nil
 }
 
 // writeSystemInfoFile writes one projected file inside root, skipping it if
-// the contents already match. Also re-validates relPath.
-func writeSystemInfoFile(root *os.Root, relPath string, data []byte) error {
+// the contents already match, and reports whether it wrote. Also re-validates
+// relPath.
+func writeSystemInfoFile(root *os.Root, relPath string, data []byte) (bool, error) {
 	if err := volumepath.ValidateProjected(relPath); err != nil {
-		return fmt.Errorf("invalid system-info path %q: %w", relPath, err)
+		return false, fmt.Errorf("invalid system-info path %q: %w", relPath, err)
 	}
 	dst := filepath.FromSlash(relPath)
 	if existing, err := root.ReadFile(dst); err == nil && bytes.Equal(existing, data) {
-		return nil
+		return false, nil
 	}
 	if dir := filepath.Dir(dst); dir != "." {
 		if err := root.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("while creating parent of %q under %q: %w", relPath, root.Name(), err)
+			return false, fmt.Errorf("while creating parent of %q under %q: %w", relPath, root.Name(), err)
 		}
 	}
 	if err := writeFileAtomicRoot(root, dst, data, 0o644); err != nil {
-		return fmt.Errorf("while writing system-info file %q under %q: %w", relPath, root.Name(), err)
+		return false, fmt.Errorf("while writing system-info file %q under %q: %w", relPath, root.Name(), err)
 	}
-	return nil
+	return true, nil
 }
 
-// writeFileAtomicRoot is writeFileAtomic confined to root. The fixed temp
+// writeFileAtomicRoot is atomicfile.Write confined to root. The fixed temp
 // name is safe because writers of an actor's volumes serialize on its lock.
 func writeFileAtomicRoot(root *os.Root, relPath string, data []byte, perm os.FileMode) error {
 	dir, base := filepath.Dir(relPath), filepath.Base(relPath)
@@ -255,23 +277,10 @@ func writeFileAtomicRoot(root *os.Root, relPath string, data []byte, perm os.Fil
 		f.Close()
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := root.Rename(tmp, relPath); err != nil {
-		return err
-	}
-
-	d, err := root.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return root.Rename(tmp, relPath)
 }
 
 // eventHandler enqueues the bundle names an event touches.
@@ -280,12 +289,15 @@ func (r *systemInfoVolumeRefresher) eventHandler() cache.ResourceEventHandler {
 		if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 			obj = d.Obj
 		}
-		ctb, ok := obj.(*certsv1beta1.ClusterTrustBundle)
-		if !ok {
+		ctb, err := meta.Accessor(obj)
+		if err != nil {
 			return
 		}
-		for _, name := range bundleNamesFor(ctb.Name) {
-			r.queue.Add(name)
+
+		// Map clustertrustbundles to the particular Substrate trust bundle names they back.
+		switch ctb.GetName() {
+		case trustbundle.EgressCTB:
+			r.queue.Add(trustbundle.EgressName)
 		}
 	}
 	return cache.ResourceEventHandlerFuncs{
@@ -332,12 +344,6 @@ func (r *systemInfoVolumeRefresher) refreshBundle(ctx context.Context, bundleNam
 	if len(targets) == 0 {
 		return nil
 	}
-	_, raw, err := rawTrustBundle(r.lister, bundleName)
-	if err != nil {
-		slog.WarnContext(ctx, "Trust bundle unreadable; projected files keep their last contents", slog.String("bundle", bundleName), slog.Any("err", err))
-		return nil
-	}
-	h := trustBundleHash(raw)
 	var writeErr error
 	refreshed := 0
 	for _, actor := range targets {
@@ -347,15 +353,25 @@ func (r *systemInfoVolumeRefresher) refreshBundle(ctx context.Context, bundleNam
 			continue
 		}
 		for _, v := range actor.volumes {
-			if !projectsBundle(v.Spec, bundleName) || v.appliedHashes[bundleName] == h {
+			if !projectsBundle(v.Spec, bundleName) {
 				continue
 			}
-			if err := r.write(actor.ref, actor.uid, v); err != nil {
+			payload, err := r.collectData(actor.ref, actor.uid, v.Spec)
+			if err != nil {
+				// Not requeued: the informer delivers the next change to
+				// the bundle, which is what could make it resolvable.
+				slog.WarnContext(ctx, "Trust bundle unresolvable; projected files keep their last contents", slog.String("actor_uid", actor.uid), slog.String("volume", v.Name), slog.String("bundle", bundleName), slog.Any("err", err))
+				continue
+			}
+			changed, err := v.apply(payload)
+			if err != nil {
 				slog.ErrorContext(ctx, "Failed to refresh system-info volume", slog.String("actor_uid", actor.uid), slog.String("volume", v.Name), slog.String("bundle", bundleName), slog.Any("err", err))
 				writeErr = err
 				continue
 			}
-			refreshed++
+			if changed {
+				refreshed++
+			}
 		}
 		actor.mu.Unlock()
 	}
@@ -366,9 +382,9 @@ func (r *systemInfoVolumeRefresher) refreshBundle(ctx context.Context, bundleNam
 }
 
 // projectsBundle reports whether the volume spec projects the named bundle.
-func projectsBundle(si *ateletpb.SystemInfoVolume, bundleName string) bool {
+func projectsBundle(si *ateletpb.SystemInfoVolumeSource, bundleName string) bool {
 	for _, ds := range si.GetDataSources() {
-		if tb := ds.GetTrustBundle(); tb != nil && tb.GetName() == bundleName {
+		if tb := ds.GetTrustBundle(); tb != nil && slices.Contains(tb.GetNames(), bundleName) {
 			return true
 		}
 	}

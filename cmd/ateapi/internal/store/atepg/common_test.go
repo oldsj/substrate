@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/authz"
+	"go.ate.dev/substrate/internal/installdefaults"
 )
 
 // clearAll truncates every table so the next test starts from an empty store
@@ -26,7 +28,7 @@ import (
 // state, so the statement lives here rather than on Persistence.
 func clearAll(t *testing.T, p *Persistence) {
 	t.Helper()
-	if _, err := p.pool.Exec(context.Background(), `TRUNCATE atespaces, actors, actor_egress_policies, actor_templates, tags, workers, worker_assignments, leases, worker_outbox, worker_outbox_trim`); err != nil {
+	if _, err := p.pool.Exec(context.Background(), `TRUNCATE atespaces, global_access_policy, atespace_access_policies, actors, actor_egress_policies, actor_templates, tags, workers, worker_assignments, leases, worker_outbox, worker_outbox_trim, tuple, changelog`); err != nil {
 		t.Fatalf("truncating tables: %v", err)
 	}
 }
@@ -40,11 +42,34 @@ func setupPostgresPersistence(t *testing.T) *Persistence {
 	}
 	t.Cleanup(p.Close)
 	clearAll(t, p)
+	setTestPolicyManager(t, p)
 	return p
 }
 
-func newTestAtespace(name string) *ateapipb.Atespace {
-	return &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}}
+// setTestPolicyManager gives p an OpenFGA-backed PolicyManager, as the server
+// always does.
+func setTestPolicyManager(t *testing.T, p *Persistence) {
+	t.Helper()
+	fgaServer, err := authz.NewOpenFGAServer(p.pool)
+	if err != nil {
+		t.Fatalf("NewOpenFGAServer failed: %v", err)
+	}
+	t.Cleanup(fgaServer.Close)
+	_, policyManager, err := authz.New(t.Context(), p.pool, fgaServer, nil, authz.SystemPrincipals{
+		ControllerSPIFFEID:       installdefaults.ControllerSPIFFEID(installdefaults.SystemNamespace),
+		EgressGatewaySPIFFEIDs:   []string{installdefaults.EgressSPIFFEID(installdefaults.SystemNamespace)},
+		IngressRouterSPIFFEID:    installdefaults.RouterSPIFFEID(installdefaults.SystemNamespace),
+		AteletSPIFFEID:           installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace),
+		APIServerSidecarSPIFFEID: installdefaults.APIServerSPIFFEID(installdefaults.SystemNamespace),
+	})
+	if err != nil {
+		t.Fatalf("authz.New failed: %v", err)
+	}
+	p.SetPolicyManager(policyManager)
+}
+
+func newTestAtespace(name string) *ateapi.Atespace {
+	return &ateapi.Atespace{Metadata: &ateapi.ResourceMetadata{Name: name}}
 }
 
 func createTestAtespace(t *testing.T, s *Persistence, name string) {

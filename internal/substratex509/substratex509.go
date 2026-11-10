@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -136,15 +136,10 @@ func validatePodIdentity(pod *PodIdentity) error {
 
 // ActorIdentity is the Substrate Actor Identity of an Actor, as embedded in the
 // oidActorIdentity extension of its certificate.
-type ActorIdentityPurpose string
-
-const ActorIdentityPurposeAtunnel ActorIdentityPurpose = "atunnel"
-
 type ActorIdentity struct {
 	Atespace  string
 	ActorName string
 	ActorUid  string
-	Purpose   ActorIdentityPurpose
 }
 
 func AddActorIdentityToCertificate(actor *ActorIdentity, template *x509.Certificate) error {
@@ -205,14 +200,8 @@ func validateActorIdentity(actor *ActorIdentity) error {
 	if actor.ActorUid == "" {
 		empty = append(empty, "ActorUid")
 	}
-	if actor.Purpose == "" {
-		empty = append(empty, "Purpose")
-	}
 	if len(empty) > 0 {
 		return fmt.Errorf("empty fields: %s", strings.Join(empty, ", "))
-	}
-	if actor.Purpose != ActorIdentityPurposeAtunnel {
-		return fmt.Errorf("unsupported Purpose %q", actor.Purpose)
 	}
 	return nil
 }

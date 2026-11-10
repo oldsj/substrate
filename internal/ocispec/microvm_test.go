@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,31 @@
 package ocispec
 
 import (
+	"reflect"
+	"regexp"
+	"slices"
+	"strings"
 	"testing"
 
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 )
+
+// kata's verify_id, see GuestContainerID
+var kataID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]+$`)
+
+func TestGuestContainerID(t *testing.T) {
+	shares := []string{ShareDurable, ShareCSI, ShareSystemInfo}
+	for _, name := range append([]string{"w", "app", strings.Repeat("a", 63)}, shares...) {
+		id := GuestContainerID(name)
+		if !kataID.MatchString(id) {
+			t.Errorf("GuestContainerID(%q) = %q, which kata rejects", name, id)
+		}
+		if slices.Contains(shares, id) {
+			t.Errorf("GuestContainerID(%q) = %q, which collides with a share dir", name, id)
+		}
+	}
+}
 
 // The device allowlist and CPU shares from guestResources are the proven-good
 // kata shape. Overlaying a memory limit must not drop them: a container without
@@ -121,11 +141,11 @@ func eqInt64Ptr(a, b *int64) bool {
 // unbound the container.
 func TestShapeMicroVM_KeepsDeclaredContainerLimits(t *testing.T) {
 	const declared = 64 * 1024 * 1024
-	spec := Build(Options{
-		ActorUID: testActorUID, ContainerName: "app", Args: []string{"/app"},
-		Resources: &ateletpb.ResourceLimits{MemoryBytes: declared},
-	})
-	if err := ShapeMicroVM(spec, MicroVMOptions{ActorUID: testActorUID, ContainerID: "app"}); err != nil {
+	spec := Build(Options{Container: &ateworkerpb.Container{ContainerSpec: &ateworkerpb.ContainerSpec{
+		Args:      []string{"/app"},
+		Resources: &ateworkerpb.ResourceRequirements{Limits: &ateworkerpb.Resources{MemoryBytes: declared}},
+	}}})
+	if err := ShapeMicroVM(spec, MicroVMOptions{ActorDirs: parityActorDirs, ContainerName: "app"}); err != nil {
 		t.Fatalf("ShapeMicroVM() = %v", err)
 	}
 
@@ -140,8 +160,8 @@ func TestShapeMicroVM_KeepsDeclaredContainerLimits(t *testing.T) {
 // A container that declares nothing must stay unbounded inside the guest: guest
 // RAM is the real ceiling, and a cap equal to the whole guest can never bind.
 func TestShapeMicroVM_LeavesUndeclaredContainerUnlimited(t *testing.T) {
-	spec := Build(Options{ActorUID: testActorUID, ContainerName: "app", Args: []string{"/app"}})
-	if err := ShapeMicroVM(spec, MicroVMOptions{ActorUID: testActorUID, ContainerID: "app"}); err != nil {
+	spec := Build(Options{Container: &ateworkerpb.Container{ContainerSpec: &ateworkerpb.ContainerSpec{Args: []string{"/app"}}}})
+	if err := ShapeMicroVM(spec, MicroVMOptions{ActorDirs: parityActorDirs, ContainerName: "app"}); err != nil {
 		t.Fatalf("ShapeMicroVM() = %v", err)
 	}
 
@@ -150,5 +170,138 @@ func TestShapeMicroVM_LeavesUndeclaredContainerUnlimited(t *testing.T) {
 	}
 	if c := spec.Linux.Resources.CPU; c != nil && c.Quota != nil && *c.Quota > 0 {
 		t.Errorf("cpu quota = %d, want unset for a container that declared none", *c.Quota)
+	}
+}
+
+func TestShapeMicroVM_AllowsLowPortsInTheGuest(t *testing.T) {
+	const portStart = "net.ipv4.ip_unprivileged_port_start"
+
+	spec := Build(Options{Container: &ateworkerpb.Container{ContainerSpec: &ateworkerpb.ContainerSpec{Args: []string{"/app"}}}})
+	if _, ok := spec.Linux.Sysctl[portStart]; ok {
+		t.Errorf("Build() set %s; it must be micro-VM only", portStart)
+	}
+	if err := ShapeMicroVM(spec, MicroVMOptions{ActorDirs: parityActorDirs, ContainerName: "app"}); err != nil {
+		t.Fatalf("ShapeMicroVM() = %v", err)
+	}
+	if v := spec.Linux.Sysctl[portStart]; v != "0" {
+		t.Errorf("%s = %q, want \"0\"", portStart, v)
+	}
+
+	preset := Build(Options{Container: &ateworkerpb.Container{ContainerSpec: &ateworkerpb.ContainerSpec{Args: []string{"/app"}}}})
+	preset.Linux.Sysctl = map[string]string{portStart: "1024"}
+	if err := ShapeMicroVM(preset, MicroVMOptions{ActorDirs: parityActorDirs, ContainerName: "app"}); err != nil {
+		t.Fatalf("ShapeMicroVM() = %v", err)
+	}
+	if v := preset.Linux.Sysctl[portStart]; v != "1024" {
+		t.Errorf("%s = %q, want the caller's value kept", portStart, v)
+	}
+}
+
+func TestShapeMicroVM_VolumesAreNodev(t *testing.T) {
+	spec := Build(parityOptions)
+	if err := ShapeMicroVM(spec, MicroVMOptions{ActorDirs: parityActorDirs, ContainerName: "app"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, dest := range parityMountPaths {
+		i := slices.IndexFunc(spec.Mounts, func(m specs.Mount) bool { return m.Destination == dest })
+		if i < 0 {
+			t.Fatalf("no mount at %s", dest)
+		}
+		opts := spec.Mounts[i].Options
+		for _, want := range []string{"rbind", "nodev"} {
+			if !slices.Contains(opts, want) {
+				t.Errorf("%s options = %v, want %s", dest, opts, want)
+			}
+		}
+		// Setuid binaries and file capabilities on volumes work, as under
+		// containerd and gVisor.
+		if slices.Contains(opts, "nosuid") {
+			t.Errorf("%s options = %v, want no nosuid", dest, opts)
+		}
+	}
+}
+
+func TestShapeMicroVM_AllowsPingWithoutNetRaw(t *testing.T) {
+	const key = "net.ipv4.ping_group_range"
+	spec := Build(Options{Container: &ateworkerpb.Container{ContainerSpec: &ateworkerpb.ContainerSpec{Args: []string{"/app"}}}})
+	if err := ShapeMicroVM(spec, MicroVMOptions{ActorDirs: parityActorDirs, ContainerName: "app"}); err != nil {
+		t.Fatal(err)
+	}
+	if v := spec.Linux.Sysctl[key]; v != "0 2147483647" {
+		t.Errorf("%s = %q, want \"0 2147483647\"", key, v)
+	}
+}
+
+func TestShapeMicroVM_MasksProcAndSys(t *testing.T) {
+	spec := Build(parityOptions)
+	if err := ShapeMicroVM(spec, MicroVMOptions{ActorDirs: parityActorDirs, ContainerName: "app"}); err != nil {
+		t.Fatalf("ShapeMicroVM() = %v", err)
+	}
+	roTmpfs := []string{"ro", "nr_blocks=1", "nr_inodes=1"}
+	for _, tc := range []struct {
+		path     string
+		readonly bool
+		masked   bool
+		mount    *specs.Mount
+	}{
+		{path: "/proc/sys", readonly: true},
+		{path: "/proc/kcore", masked: true},
+		{path: "/sys/firmware", mount: &specs.Mount{Destination: "/sys/firmware", Type: "tmpfs", Source: "tmpfs", Options: roTmpfs}},
+		// Not in the guest kernel, so masking them would fail container start.
+		{path: "/proc/asound"},
+		{path: "/proc/scsi"},
+		{path: "/sys/devices/virtual/powercap"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			if got := slices.Contains(spec.Linux.ReadonlyPaths, tc.path); got != tc.readonly {
+				t.Errorf("in ReadonlyPaths = %v, want %v", got, tc.readonly)
+			}
+			if got := slices.Contains(spec.Linux.MaskedPaths, tc.path); got != tc.masked {
+				t.Errorf("in MaskedPaths = %v, want %v", got, tc.masked)
+			}
+			var got *specs.Mount
+			if i := slices.IndexFunc(spec.Mounts, func(m specs.Mount) bool { return m.Destination == tc.path }); i >= 0 {
+				got = &spec.Mounts[i]
+			}
+			if !reflect.DeepEqual(got, tc.mount) {
+				t.Errorf("mount = %+v, want %+v", got, tc.mount)
+			}
+		})
+	}
+}
+
+func TestGuestMaskedDirPaths(t *testing.T) {
+	for _, tc := range []struct {
+		goarch string
+		want   []string
+	}{
+		{goarch: "amd64", want: []string{"/sys/firmware", "/proc/acpi"}},
+		{goarch: "arm64", want: []string{"/sys/firmware"}},
+	} {
+		t.Run(tc.goarch, func(t *testing.T) {
+			if got := guestMaskedDirPaths(tc.goarch); !slices.Equal(got, tc.want) {
+				t.Errorf("guestMaskedDirPaths(%q) = %v, want %v", tc.goarch, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestShapeMicroVM_SystemMounts(t *testing.T) {
+	spec := Build(Options{Container: &ateworkerpb.Container{ContainerSpec: &ateworkerpb.ContainerSpec{Args: []string{"/app"}}}})
+	if err := ShapeMicroVM(spec, MicroVMOptions{ActorDirs: parityActorDirs, ContainerName: "app"}); err != nil {
+		t.Fatalf("ShapeMicroVM() = %v", err)
+	}
+	for _, want := range []specs.Mount{
+		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
+		{Destination: "/dev/mqueue", Type: "mqueue", Source: "mqueue", Options: []string{"nosuid", "noexec", "nodev"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+		{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777"}},
+	} {
+		if got := mountFor(t, spec, want.Destination); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s after ShapeMicroVM =\n%+v\nwant\n%+v", want.Destination, got, want)
+		}
 	}
 }

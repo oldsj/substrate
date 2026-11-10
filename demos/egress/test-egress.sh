@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,8 +23,9 @@
 #     certificate, cannot open a tunnel: the gateway trusts the actor-identity
 #     CA, so the mTLS handshake itself is refused.
 #
-# Prerequisites: a substrate cluster with `--deploy-demo-egress` applied, plus
-# kubectl and kubectl-ate on PATH. See demos/egress/README.md.
+# Prerequisites: a substrate cluster with `ate-setup deploy demo egress` applied, plus
+# kubectl and kubectl-ate on PATH. The install's --ingress-allowed-spiffe-ids
+# must include spiffe://cluster.local/ns/ate-system/sa/atenet-client. See demos/egress/README.md.
 #
 # Usage:
 #   demos/egress/test-egress.sh            # run the tests
@@ -32,7 +33,12 @@
 
 set -o errexit -o nounset -o pipefail
 
-CTX="${KUBECTL_CONTEXT:-kind-kind}"
+# Target the cluster ate-setup deploys to: KUBECTL_CONTEXT, else the kind
+# cluster when ATE_INSTALL_KIND=true, else the current context.
+if [[ -z "${KUBECTL_CONTEXT:-}" && "${ATE_INSTALL_KIND:-}" == "true" ]]; then
+  KUBECTL_CONTEXT="kind-${KIND_CLUSTER_NAME:-kind}"
+fi
+CTX="${KUBECTL_CONTEXT:-$(kubectl config current-context)}"
 # The actor lives in the demo's atespace: --template resolves the
 # template by name within the actor's own atespace.
 ATESPACE="${ATESPACE:-ate-demo-egress}"
@@ -97,7 +103,7 @@ log "create + resume Actor ${ATESPACE}/${ACTOR}, allow all its egress"
 ${KATE} create atespace "${ATESPACE}" >/dev/null 2>&1 || true
 ${KATE} create actor "${ACTOR}" -a "${ATESPACE}" --template "${TEMPLATE}" >/dev/null 2>&1 || true
 ${KATE} resume actor "${ACTOR}" -a "${ATESPACE}" >/dev/null 2>&1 || true
-printf 'rules:\n- all: {}\n' | ${KATE} create egress-policy "${ACTOR}" -a "${ATESPACE}" -f - >/dev/null 2>&1 || true
+printf 'rules:\n- http: {hostnames: ["*"], ports: {all: {}}}\n- https: {hostnames: ["*"]}\n' | ${KATE} create egress-policy "${ACTOR}" -a "${ATESPACE}" -f - >/dev/null 2>&1 || true
 # Avoid 'grep -q': its early exit triggers SIGPIPE (exit 141) under pipefail while kubectl writes.
 actor_running() {
   ${KATE} get actors -a "${ATESPACE}" 2>/dev/null | grep "${ACTOR}" | grep ACTOR_STATE_RUNNING >/dev/null
@@ -118,10 +124,9 @@ wait_egress_log() { for _ in $(seq 1 10); do if egress_log_since "$1" | grep -qE
 log "POSITIVE — real Actor egress is tunneled through the gateway (expect 200)"
 ##############################################################################
 BEFORE=$(egress_log_count)
-${K} -n ate-system port-forward service/atenet-router 18099:80 >/tmp/egress-pf.log 2>&1 &
+${KATE} proxy actor "${ACTOR}" 18099:80 -a "${ATESPACE}" >/tmp/egress-pf.log 2>&1 &
 PF=$!; sleep 4
 CODE=$(curl -s -o /tmp/egress-body.txt -w '%{http_code}' -X POST http://localhost:18099/ \
-  -H "ate-target-actor: ${ATESPACE}/${ACTOR}" \
   -H 'Content-Type: application/json' \
   -d "{\"url\":\"http://${TARGET_IP}:${TARGET_PORT}/\"}" || true)
 kill "${PF}" >/dev/null 2>&1 || true
@@ -137,7 +142,7 @@ fi
 if [[ "${DATAPLANE}" == "envoy" ]]; then
   # Envoy's access log identifies the peer by its certificate SAN, not by any
   # header the actor could have written.
-  ALLOWED_LOG_PATTERN="actor/${ACTOR}.*code=200"
+  ALLOWED_LOG_PATTERN="worker-for-actor/${ATESPACE}/${ACTOR}.*code=200"
 else
   # agentgateway's structured access log records the CONNECT authority. Actor
   # authentication is also covered by the successful request and negative test.

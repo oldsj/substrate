@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -103,7 +103,10 @@ class KernelMemUser(User):
         try:
             with traced_grpc("SuspendActor", self.__class__.__name__) as metadata:
                 _, metadata.call = self.stub.SuspendActor.with_call(
-                    ateapi_pb2.SuspendActorRequest(actor=self.actor_ref),
+                    ateapi_pb2.SuspendActorRequest(
+                        actor=self.actor_ref,
+                        options=ateapi_pb2.SuspendOptions(mode=ateapi_pb2.DURABILITY_MODE_SYNCHRONOUS),
+                    ),
                     metadata=metadata,
                 )
         except Exception:

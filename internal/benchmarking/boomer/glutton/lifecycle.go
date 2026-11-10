@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,15 +29,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateinterceptors"
-	"github.com/agent-substrate/substrate/internal/atenet"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/boomerutil"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/dynconfig"
-	bmetrics "github.com/agent-substrate/substrate/internal/benchmarking/boomer/metrics"
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/userclass"
-	gluttonpb "github.com/agent-substrate/substrate/internal/proto/glutton"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/uuid"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/ateinterceptors"
+	"go.ate.dev/substrate/internal/atenet"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/boomerutil"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/dynconfig"
+	bmetrics "go.ate.dev/substrate/internal/benchmarking/boomer/metrics"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/userclass"
+	gluttonpb "go.ate.dev/substrate/internal/proto/glutton"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
@@ -55,23 +55,11 @@ const (
 	pingPath         = "/ping"
 	writeRAMPath     = "/writeram"
 	readRAMPath      = "/readram"
+	useCPUPath       = "/usecpu"
 	memLoadKey       = "memload"
 	memReadAll       = "all"
 
-	// ateapi returns Aborted with this message when two callers race an
-	// actor update (see cmd/ateapi/internal/controlapi/workflow_resume.go).
-	// It's transient — the loser retries and one of them wins.
-	concurrentUpdateMsg = "concurrent update conflict, please retry"
-	// Retry budget for ResumeActor concurrent-update conflicts. First retry
-	// is immediate (no initial backoff — conflicts often clear the instant
-	// the racing writer commits); subsequent gaps are 50ms plus uniform
-	// jitter in [0, resumeBackoffJitter) so the losers of one race do not
-	// retry in lockstep and lose the next one the same way.
-	resumeMaxAttempts   = 5
-	resumeMaxBackoff    = 50 * time.Millisecond
-	resumeBackoffJitter = 5 * time.Millisecond
-
-	// Consecutive replaceIfPersistent failures it takes to replace an actor.
+	// Consecutive ReplaceIfPersistent failures it takes to replace an actor.
 	// One blip is not evidence of a wedged actor; three in a row, each
 	// spaced by the wait window, is.
 	maxConsecutiveFailures = 3
@@ -88,6 +76,7 @@ func init() {
 		Name:       "glutton",
 		LocustFile: "glutton.py",
 		UserClass:  userClass,
+		Config:     gluttonCodec,
 		Init:       initPing,
 	})
 }
@@ -153,7 +142,7 @@ func (r *taskRuntime) iterate() {
 
 	// Going straight back to resume on a stranded actor would turn every
 	// retryable hibernate failure into a FailedPrecondition and cost the
-	// actor anyway. SuspendActor and PauseActor are re-entrant, so finish
+	// actor anyway. SuspendActor is re-entrant in either mode, so finish
 	// the hibernate and pick the cycle up next iteration.
 	if actor.hibernatePending {
 		if err := actor.hibernate(ctx); err != nil && actor.noteFailure(err) {
@@ -162,16 +151,21 @@ func (r *taskRuntime) iterate() {
 		return
 	}
 
-	if err := actor.resume(ctx); err != nil {
-		if actor.noteFailure(err) {
-			user.replaceActor(ctx, actor)
+	if !actor.actorRunning || dynconfig.Get[gluttonKnobs](r.cfg.Dyn).LifecycleMode != dynconfig.LifecycleModeNone {
+		if err := actor.resume(ctx); err != nil {
+			if actor.noteFailure(err) {
+				user.replaceActor(ctx, actor)
+			}
+			return
 		}
-		return
 	}
 	// Fill before the first suspend so every snapshot from cycle one on
 	// carries the full working set; glutton keeps the allocations across
 	// suspend/resume, so this runs once per actor (retried if it fails).
 	actor.ensureRAMFilled(ctx)
+	// Start the CPU load once per actor for the same reason: glutton's
+	// spinning goroutines survive suspend/resume with the rest of the process.
+	actor.ensureCPULoad(ctx)
 	// Walk the working set right after resume, before churn dirties it:
 	// under a demand-paged restore every touched page must be paged back
 	// in before the walk returns, so its latency measures the true cost
@@ -190,7 +184,7 @@ func (r *taskRuntime) iterate() {
 	// actor stays live for the full window. With the default zero window
 	// the actor is hibernated right after the first ping.
 	deadline := time.Now().Add(r.liveWait())
-	maxPings := max(r.cfg.Dyn.Load().MaxPingsPerWake, 1)
+	maxPings := max(dynconfig.Get[gluttonKnobs](r.cfg.Dyn).MaxPingsPerWake, 1)
 	actor.ping(ctx)
 	for sent := 1; sent < maxPings; sent++ {
 		gap := minPingGap + time.Duration(rand.Float64()*float64(maxPingGap-minPingGap))
@@ -258,7 +252,11 @@ func (r *taskRuntime) shutdown(ctx context.Context) {
 		u := val.(*gluttonUser)
 		for _, a := range u.actors {
 			if a.actorRunning {
-				_ = a.hibernate(ctx)
+				if dynconfig.Get[gluttonKnobs](r.cfg.Dyn).LifecycleMode == dynconfig.LifecycleModeSync {
+					_ = a.suspend(ctx)
+				} else {
+					_ = a.pause(ctx)
+				}
 			}
 			a.delete(ctx)
 		}
@@ -270,24 +268,15 @@ func (r *taskRuntime) shutdown(ctx context.Context) {
 // dynamicWait is the gap between suspending one actor and resuming the
 // VU's next one, drawn uniformly from [MinWait, MaxWait].
 func (r *taskRuntime) dynamicWait() time.Duration {
-	cfg := r.cfg.Dyn.Load()
-	return uniformWait(cfg.MinWait, cfg.MaxWait)
+	return dynconfig.Get[gluttonKnobs](r.cfg.Dyn).WaitTime.Draw()
 }
 
 // liveWait is how long an actor stays resumed between its first ping and
 // its suspend, drawn uniformly from [MinLive, MaxLive]. The default zero
 // window suspends right after the ping.
 func (r *taskRuntime) liveWait() time.Duration {
-	cfg := r.cfg.Dyn.Load()
-	return uniformWait(cfg.MinLive, cfg.MaxLive)
-}
-
-// uniformWait draws from [lo, hi]; an inverted or empty range yields lo.
-func uniformWait(lo, hi time.Duration) time.Duration {
-	if hi <= lo {
-		return lo
-	}
-	return lo + time.Duration(rand.Float64()*float64(hi-lo))
+	knobs := dynconfig.Get[gluttonKnobs](r.cfg.Dyn)
+	return dynconfig.Uniform(knobs.MinLive.Duration(), knobs.MaxLive.Duration())
 }
 
 // gluttonUser is one VU (boomer goroutine). It owns --actors-per-user actors
@@ -346,11 +335,12 @@ type gluttonActor struct {
 	firstResume  bool
 	actorRunning bool
 	ramFilled    bool
+	cpuLoaded    bool
 	// crashed is set the first time ResumeActor reports the actor as
 	// ACTOR_STATE_CRASHED (codes.Aborted with "crashed" in the message).
 	// ateapi never rehabilitates one, so iterate() replaces it.
 	crashed bool
-	// hibernatePending is set by a failed Pause/Suspend: the actor is
+	// hibernatePending is set by a failed SuspendActor: the actor is
 	// stranded RUNNING or SUSPENDING, which resume has no edge out of.
 	hibernatePending bool
 	// deleted is set once replaceActor has issued this actor's DeleteActor,
@@ -361,63 +351,13 @@ type gluttonActor struct {
 	consecutiveFailures int
 }
 
-// failureAction is what iterate() does about a failed lifecycle RPC: is this
-// actor wedged, or is the cluster busy? Only the first is worth a
-// delete + create.
-type failureAction int
-
-const (
-	// retryLater: a replacement would hit the same error, so keep the actor.
-	retryLater failureAction = iota
-	// replaceNow: this actor can never make progress again.
-	replaceNow
-	// replaceIfPersistent: counts toward maxConsecutiveFailures.
-	replaceIfPersistent
-)
-
-// classifyLifecycleFailure maps an error from ResumeActor / SuspendActor /
-// PauseActor onto what to do about it. Unrecognized codes are recoverable
-// until proven otherwise: a wrapped atelet error arrives as Unknown.
-func classifyLifecycleFailure(err error) failureAction {
-	s, ok := status.FromError(err)
-	if !ok {
-		return replaceIfPersistent
-	}
-	switch s.Code() {
-	case codes.NotFound, codes.DataLoss:
-		// The actor, or the snapshot it would resume from, is gone.
-		return replaceNow
-	case codes.FailedPrecondition:
-		// A state this operation has no edge out of — the left-in-SUSPENDING
-		// case. Nothing glutton can call moves the actor on.
-		return replaceNow
-	case codes.Aborted:
-		if strings.Contains(s.Message(), "crashed") {
-			return replaceNow
-		}
-		// Concurrent update conflict. resume() already spent its retry
-		// budget, but losing every race in one burst is still a race.
-		return replaceIfPersistent
-	case codes.ResourceExhausted, codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
-		// Cluster-wide and load-dependent ("no free workers available", a
-		// restarting ate-api-server): every VU sees these at once, and the
-		// replacement needs the capacity the original was denied.
-		return retryLater
-	case codes.InvalidArgument, codes.PermissionDenied, codes.Unauthenticated, codes.Unimplemented:
-		// A misconfigured run. The replacement is created the same way and
-		// fails the same way.
-		return retryLater
-	}
-	return replaceIfPersistent
-}
-
 // noteFailure records a failed lifecycle RPC against the actor and reports
 // whether the VU should replace it.
 func (u *gluttonActor) noteFailure(err error) bool {
-	switch classifyLifecycleFailure(err) {
-	case replaceNow:
+	switch boomerutil.ClassifyLifecycleFailure(err) {
+	case boomerutil.ReplaceNow:
 		return true
-	case retryLater:
+	case boomerutil.RetryLater:
 		return false
 	}
 	u.consecutiveFailures++
@@ -437,8 +377,8 @@ func (u *gluttonActor) noteSuccess() {
 	u.consecutiveFailures = 0
 }
 
-func (u *gluttonActor) ref() *ateapipb.ObjectRef {
-	return &ateapipb.ObjectRef{Atespace: u.cfg.Atespace, Name: u.actorName}
+func (u *gluttonActor) ref() *ateapi.ObjectRef {
+	return &ateapi.ObjectRef{Atespace: u.cfg.Atespace, Name: u.actorName}
 }
 
 // ensureAtespace creates the configured atespace, swallowing AlreadyExists
@@ -447,9 +387,9 @@ func (u *gluttonActor) ref() *ateapipb.ObjectRef {
 // other API call.
 func (u *gluttonActor) ensureAtespace(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateAtespace", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateAtespace(callCtx, &ateapipb.CreateAtespaceRequest{
-			Atespace: &ateapipb.Atespace{
-				Metadata: &ateapipb.ResourceMetadata{
+		_, err := u.cfg.APIStub.CreateAtespace(callCtx, &ateapi.CreateAtespaceRequest{
+			Atespace: &ateapi.Atespace{
+				Metadata: &ateapi.ResourceMetadata{
 					Name: u.cfg.Atespace,
 				},
 			},
@@ -466,10 +406,10 @@ func (u *gluttonActor) ensureAtespace(ctx context.Context) error {
 
 func (u *gluttonActor) create(ctx context.Context) error {
 	return u.tracedCall(ctx, "CreateActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapipb.CreateActorRequest{
-			Actor: &ateapipb.Actor{
-				Metadata:      &ateapipb.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: templateAtespace, Name: templateName},
+		_, err := u.cfg.APIStub.CreateActor(callCtx, &ateapi.CreateActorRequest{
+			Actor: &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: u.cfg.Atespace, Name: u.actorName},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: templateAtespace, Name: templateName},
 			},
 		}, grpc.Trailer(tr))
 		return err
@@ -487,36 +427,18 @@ func (u *gluttonActor) resume(ctx context.Context) error {
 		// the ateapi contract. Kept inside the tracedCall closure so the
 		// reported latency spans every attempt and the span carries the
 		// last attempt's server trailer, same as any other single-shot RPC.
-		var backoff time.Duration // 0 → first retry runs immediately
-		var lastErr error
-		for range resumeMaxAttempts {
-			_, lastErr = u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
+		return boomerutil.RetryOnConflict(callCtx, func() error {
+			_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapi.ResumeActorRequest{
 				Actor: u.ref(),
 			}, grpc.Trailer(tr))
-			if lastErr == nil {
-				return nil
-			}
-			if !isConcurrentUpdateConflict(lastErr) {
-				return lastErr
-			}
-			if backoff > 0 {
-				jitter := time.Duration(rand.Float64() * float64(resumeBackoffJitter))
-				select {
-				case <-time.After(backoff + jitter):
-				case <-callCtx.Done():
-					return callCtx.Err()
-				}
-			}
-			backoff = resumeMaxBackoff
-		}
-		return lastErr
+			return err
+		})
 	})
 	if err != nil {
-		// ateapi reports a crashed actor as codes.Aborted with "crashed" in
-		// the message (see workflow_resume.go). Mark the user so iterate()
-		// stops touching it, and surface a CrashCount tick so operators can
-		// see the crash total in the locust stats table.
-		if s, ok := status.FromError(err); ok && s.Code() == codes.Aborted && strings.Contains(s.Message(), "crashed") {
+		// Mark a crashed actor so iterate() stops touching it, and surface a
+		// CrashCount tick so operators can see the crash total in the
+		// locust stats table.
+		if boomerutil.IsCrashed(err) {
 			u.crashed = true
 			bmetrics.RecordFailure("actor", "CrashCount", userClass, 0, "actor entered ACTOR_STATE_CRASHED")
 			slog.Warn("glutton actor crashed; will stop sending requests",
@@ -531,29 +453,26 @@ func (u *gluttonActor) resume(ctx context.Context) error {
 	return nil
 }
 
-// isConcurrentUpdateConflict identifies the transient racy-update error
-// ateapi's workflow_*.go returns as codes.Aborted with the retry-me message.
-// Kept distinct from the "crashed" Aborted check in resume() because the two
-// look the same at the code level and mean opposite things.
-func isConcurrentUpdateConflict(err error) bool {
-	s, ok := status.FromError(err)
-	return ok && s.Code() == codes.Aborted && strings.Contains(s.Message(), concurrentUpdateMsg)
-}
-
 // hibernate takes the actor off its worker by whichever operation the
-// lifecycle mode selects: PauseActor keeps the snapshot on the node, while
-// SuspendActor writes it to durable storage.
+// lifecycle mode selects: an async SuspendActor keeps the snapshot on the
+// node, a sync one writes it to durable storage, and LifecycleModeNone
+// leaves the actor running on its worker.
 func (u *gluttonActor) hibernate(ctx context.Context) error {
-	if u.cfg.Dyn.Load().LifecycleMode == dynconfig.LifecycleModePause {
+	switch dynconfig.Get[gluttonKnobs](u.cfg.Dyn).LifecycleMode {
+	case dynconfig.LifecycleModeNone:
+		return nil
+	case dynconfig.LifecycleModeSync:
+		return u.suspend(ctx)
+	default:
 		return u.pause(ctx)
 	}
-	return u.suspend(ctx)
 }
 
 func (u *gluttonActor) pause(ctx context.Context) error {
-	err := u.tracedCall(ctx, "PauseActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.PauseActor(callCtx, &ateapipb.PauseActorRequest{
-			Actor: u.ref(),
+	err := u.tracedCall(ctx, "SuspendActorAsync", func(callCtx context.Context, tr *metadata.MD) error {
+		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapi.SuspendActorRequest{
+			Actor:   u.ref(),
+			Options: &ateapi.SuspendOptions{Mode: ateapi.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS},
 		}, grpc.Trailer(tr))
 		return err
 	})
@@ -567,8 +486,9 @@ func (u *gluttonActor) pause(ctx context.Context) error {
 
 func (u *gluttonActor) suspend(ctx context.Context) error {
 	err := u.tracedCall(ctx, "SuspendActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapipb.SuspendActorRequest{
-			Actor: u.ref(),
+		_, err := u.cfg.APIStub.SuspendActor(callCtx, &ateapi.SuspendActorRequest{
+			Actor:   u.ref(),
+			Options: &ateapi.SuspendOptions{Mode: ateapi.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
 		}, grpc.Trailer(tr))
 		return err
 	})
@@ -582,9 +502,8 @@ func (u *gluttonActor) suspend(ctx context.Context) error {
 
 func (u *gluttonActor) delete(ctx context.Context) {
 	_ = u.tracedCall(ctx, "DeleteActor", func(callCtx context.Context, tr *metadata.MD) error {
-		_, err := u.cfg.APIStub.DeleteActor(callCtx, &ateapipb.DeleteActorRequest{
-			Actor:    u.ref(),
-			AnyState: true,
+		_, err := u.cfg.APIStub.DeleteActor(callCtx, &ateapi.DeleteActorRequest{
+			Actor: u.ref(),
 		}, grpc.Trailer(tr))
 		return err
 	})
@@ -685,7 +604,7 @@ func (u *gluttonActor) ensureRAMFilled(ctx context.Context) {
 	if u.ramFilled {
 		return
 	}
-	target := u.cfg.Dyn.Load().MemTarget
+	target := dynconfig.Get[gluttonKnobs](u.cfg.Dyn).MemTarget
 	if target == "" {
 		u.ramFilled = true
 		return
@@ -706,6 +625,40 @@ func (u *gluttonActor) ensureRAMFilled(ctx context.Context) {
 	bmetrics.RecordSuccess("http", "GluttonFillRAM", userClass, clientLatency, 0)
 }
 
+// ensureCPULoad starts cpu_cores goroutines in the actor, each burning
+// cpu_duty_cycle of one core, through the glutton UseCPU API. Like
+// ensureRAMFilled it runs once per actor: the goroutines live in the
+// glutton process, so they resume with it and the actor draws the load
+// whenever it is running. A failure leaves cpuLoaded unset so the next
+// iteration retries. Reports as its own GluttonUseCPU stats row.
+func (u *gluttonActor) ensureCPULoad(ctx context.Context) {
+	if u.cpuLoaded {
+		return
+	}
+	knobs := dynconfig.Get[gluttonKnobs](u.cfg.Dyn)
+	if knobs.CPUCores == 0 {
+		u.cpuLoaded = true
+		return
+	}
+
+	ctx, span := u.cfg.Tracer.Start(ctx, "GluttonUseCPU")
+	defer span.End()
+	start := time.Now()
+
+	err := u.postProto(ctx, useCPUPath, &gluttonpb.UseCPURequest{
+		NumCores:  int32(knobs.CPUCores),
+		DutyCycle: knobs.CPUDutyCycle,
+	}, &gluttonpb.UseCPUResponse{})
+	clientLatency := time.Since(start)
+	boomerutil.LogSampledTrace(span, "GluttonUseCPU", clientLatency, boomerutil.SourceClient, err)
+	if err != nil {
+		bmetrics.RecordFailure("http", "GluttonUseCPU", userClass, clientLatency, err.Error())
+		return
+	}
+	u.cpuLoaded = true
+	bmetrics.RecordSuccess("http", "GluttonUseCPU", userClass, clientLatency, 0)
+}
+
 // churnRAM re-randomizes mem_churn bytes of the working set in place
 // (WriteRAM rotate on the fill's key), so pages arrive dirty at every
 // suspend instead of only the first: a fill-once set is static, and any
@@ -716,7 +669,7 @@ func (u *gluttonActor) ensureRAMFilled(ctx context.Context) {
 // iteration, only after the fill has succeeded, and reports as its own
 // GluttonChurnRAM stats row.
 func (u *gluttonActor) churnRAM(ctx context.Context) {
-	churn := u.cfg.Dyn.Load().MemChurn
+	churn := dynconfig.Get[gluttonKnobs](u.cfg.Dyn).MemChurn
 	if churn == "" || !u.ramFilled {
 		return
 	}
@@ -742,7 +695,7 @@ func (u *gluttonActor) churnRAM(ctx context.Context) {
 // memory; on an eagerly-restored actor it degenerates to a fast in-memory
 // scan, so the two restore modes are directly comparable.
 func (u *gluttonActor) readRAM(ctx context.Context) {
-	read := u.cfg.Dyn.Load().MemRead
+	read := dynconfig.Get[gluttonKnobs](u.cfg.Dyn).MemRead
 	if read == "" || !u.ramFilled {
 		return
 	}

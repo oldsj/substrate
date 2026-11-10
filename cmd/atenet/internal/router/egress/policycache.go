@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,9 +26,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/internal/egresspolicy"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/egresspolicy"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 // DefaultPolicyCacheTTL is how long a fetched policy stays usable, and so how
@@ -47,7 +47,7 @@ var errNoPolicy = errors.New("actor has no egress policy")
 // policyCache holds each actor's compiled EgressPolicy for one TTL. Every leg
 // reads through it, so the CONNECT warms the entry for the requests inside.
 type policyCache struct {
-	client ateapipb.ControlClient
+	client ateapi.ControlClient
 	// ttl of 0 disables caching: every call fetches.
 	ttl time.Duration
 	now func() time.Time
@@ -73,7 +73,7 @@ type policyEntry struct {
 	expires time.Time
 }
 
-func newPolicyCache(client ateapipb.ControlClient, ttl time.Duration) *policyCache {
+func newPolicyCache(client ateapi.ControlClient, ttl time.Duration) *policyCache {
 	return &policyCache{
 		client:    client,
 		ttl:       ttl,
@@ -86,21 +86,21 @@ func newPolicyCache(client ateapipb.ControlClient, ttl time.Duration) *policyCac
 // get returns the actor's compiled policy, fetching when there is no live
 // entry, or errNoPolicy. Fetch errors are never cached.
 func (c *policyCache) get(ctx context.Context, ref resources.ActorRef) (*egresspolicy.Policy, error) {
-	if c.ttl > 0 {
-		c.mu.Lock()
-		entry, ok := c.entries[ref]
-		c.mu.Unlock()
-		if ok && c.now().Before(entry.expires) {
-			if entry.policy == nil {
-				return nil, errNoPolicy
-			}
-			return entry.policy, nil
+	if policy, ok := c.cached(ref); ok {
+		if policy == nil {
+			return nil, errNoPolicy
 		}
+		return policy, nil
 	}
 
 	// The fetch outlives the caller: the leader of a flight going away must
 	// not fail the callers that joined it.
 	ch := c.flight.DoChan(ref.String(), func() (any, error) {
+		// A flight that finished between the miss above and DoChan has
+		// already stored a fresh entry.
+		if policy, ok := c.cached(ref); ok {
+			return policy, nil
+		}
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), policyFetchTimeout)
 		defer cancel()
 		return c.fetch(fetchCtx, ref)
@@ -120,10 +120,24 @@ func (c *policyCache) get(ctx context.Context, ref resources.ActorRef) (*egressp
 	}
 }
 
+// cached returns ref's unexpired entry; a nil policy is a cached "no policy".
+func (c *policyCache) cached(ref resources.ActorRef) (*egresspolicy.Policy, bool) {
+	if c.ttl <= 0 {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[ref]
+	if !ok || !c.now().Before(entry.expires) {
+		return nil, false
+	}
+	return entry.policy, true
+}
+
 // fetch loads and compiles one actor's policy and stores the result. A nil
 // policy with a nil error is the stored form of "no policy".
 func (c *policyCache) fetch(ctx context.Context, ref resources.ActorRef) (*egresspolicy.Policy, error) {
-	resp, err := c.client.GetActorEgressPolicy(ctx, &ateapipb.GetActorEgressPolicyRequest{Actor: ref.ToObjectRef()})
+	resp, err := c.client.GetActorEgressPolicy(ctx, &ateapi.GetActorEgressPolicyRequest{Actor: ref.ToObjectRef(), Name: resources.SingletonName})
 	var policy *egresspolicy.Policy
 	switch {
 	case err == nil:

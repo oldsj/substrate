@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,9 +24,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/agent-substrate/substrate/internal/installdefaults"
-	"github.com/agent-substrate/substrate/internal/portforward"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/clustertrustbundle"
+	"go.ate.dev/substrate/internal/installdefaults"
+	"go.ate.dev/substrate/internal/portforward"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
@@ -35,7 +36,6 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-
 	authv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -74,6 +74,13 @@ func clientServiceAccount() string {
 	return installdefaults.ClientServiceAccount
 }
 
+// FallbackPrincipal is the principal a client authenticates as when it is
+// given no token file: the ServiceAccount it mints a token from. Every caller
+// relying on the fallback is this same principal.
+func FallbackPrincipal() string {
+	return fmt.Sprintf("system:serviceaccount:%s:%s", systemNamespace(), clientServiceAccount())
+}
+
 // systemNamespace is the namespace the client expects ateapi to be running in.
 func systemNamespace() string {
 	if ns := os.Getenv(NamespaceEnv); ns != "" {
@@ -99,7 +106,7 @@ const (
 
 // Client wraps the gRPC ControlClient and ensures the port-forward connection is closed when done.
 type Client struct {
-	ateapipb.ControlClient
+	ateapi.ControlClient
 	conn           *grpc.ClientConn
 	cancel         func()
 	tracerProvider *sdktrace.TracerProvider
@@ -126,9 +133,17 @@ func (c *Client) Close() {
 	}
 }
 
+// WorkerService returns a WorkerService client on the same connection. Only
+// atelet is permitted to call WorkerService; this exists so tests can check
+// that other callers are rejected.
+func (c *Client) WorkerService() ateapi.WorkerServiceClient {
+	return ateapi.NewWorkerServiceClient(c.conn)
+}
+
 // NewClient creates a new Ate API client. If endpoint is empty, it automatically
 // port-forwards to the ate-api-server pod in substrate's system namespace.
-func NewClient(ctx context.Context, kubeconfigPath, k8sContext, endpoint, tokenFile string, traceEnabled bool) (*Client, error) {
+// extraOpts are appended to the options used to dial the server.
+func NewClient(ctx context.Context, kubeconfigPath, k8sContext, endpoint, tokenFile string, traceEnabled bool, extraOpts ...grpc.DialOption) (*Client, error) {
 	tp, err := initTracing(ctx, traceEnabled)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize tracing: %w", err)
@@ -136,9 +151,9 @@ func NewClient(ctx context.Context, kubeconfigPath, k8sContext, endpoint, tokenF
 
 	var cli *Client
 	if endpoint != "" {
-		cli, err = dialDirect(ctx, kubeconfigPath, k8sContext, endpoint, tokenFile, traceEnabled)
+		cli, err = dialDirect(ctx, kubeconfigPath, k8sContext, endpoint, tokenFile, traceEnabled, extraOpts...)
 	} else {
-		cli, err = dialPortForward(ctx, kubeconfigPath, k8sContext, tokenFile, traceEnabled)
+		cli, err = dialPortForward(ctx, kubeconfigPath, k8sContext, tokenFile, traceEnabled, extraOpts...)
 	}
 
 	if err != nil {
@@ -152,16 +167,14 @@ func NewClient(ctx context.Context, kubeconfigPath, k8sContext, endpoint, tokenF
 	return cli, nil
 }
 
-func dialDirect(ctx context.Context, kubeconfigPath, k8sContext, endpoint, tokenFile string, traceEnabled bool) (*Client, error) {
+func dialDirect(ctx context.Context, kubeconfigPath, k8sContext, endpoint, tokenFile string, traceEnabled bool, extraOpts ...grpc.DialOption) (*Client, error) {
 	config, err := LoadKubeConfig(kubeconfigPath, k8sContext)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
 	}
 
-	// We fetch a ClusterTrustBundle via the certificates.k8s.io/v1beta1 API in
-	// serverTLSConfig().  Until we migrate to certificates.k8s.io/v1
-	// ClusterTrustBundle (which locks us into supporting only k8s 1.37+
-	// clusters), client-go will print out a warning every time it initializes.
+	// Older clusters use the deprecated beta ClusterTrustBundle API.
+	// Suppress its warnings when falling back from v1.
 	config.WarningHandlerWithContext = &rest.NoWarnings{}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -171,7 +184,7 @@ func dialDirect(ctx context.Context, kubeconfigPath, k8sContext, endpoint, token
 
 	// Verify the server before attaching the bearer token below: the token
 	// must never be sent over an unauthenticated channel.
-	tlsCfg, err := serverTLSConfig(ctx, clientset)
+	tlsCfg, err := serverTLSConfig(ctx, clientset, apiServerName())
 	if err != nil {
 		return nil, err
 	}
@@ -187,15 +200,16 @@ func dialDirect(ctx context.Context, kubeconfigPath, k8sContext, endpoint, token
 	opts = append(opts, tokenOpt)
 
 	if traceEnabled {
-		opts = append(opts, grpc.WithUnaryInterceptor(newTraceInterceptor()))
+		opts = append(opts, grpc.WithChainUnaryInterceptor(newTraceInterceptor()))
 	}
+	opts = append(opts, extraOpts...)
 
 	conn, err := grpc.NewClient(endpoint, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial manual endpoint: %w", err)
 	}
 	return &Client{
-		ControlClient: ateapipb.NewControlClient(conn),
+		ControlClient: ateapi.NewControlClient(conn),
 		conn:          conn,
 		cancel:        func() {},
 	}, nil
@@ -209,16 +223,14 @@ func LoadKubeConfig(kubeconfigPath, k8sContext string) (*rest.Config, error) {
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).ClientConfig()
 }
 
-func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile string, traceEnabled bool) (*Client, error) {
+func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile string, traceEnabled bool, extraOpts ...grpc.DialOption) (*Client, error) {
 	config, err := LoadKubeConfig(kubeconfigPath, k8sContext)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
 	}
 
-	// We fetch a ClusterTrustBundle via the certificates.k8s.io/v1beta1 API in
-	// serverTLSConfig().  Until we migrate to certificates.k8s.io/v1
-	// ClusterTrustBundle (which locks us into supporting only k8s 1.37+
-	// clusters), client-go will print out a warning every time it initializes.
+	// Older clusters use the deprecated beta ClusterTrustBundle API.
+	// Suppress its warnings when falling back from v1.
 	config.WarningHandlerWithContext = &rest.NoWarnings{}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -234,7 +246,7 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 	}
 	localEndpoint := fmt.Sprintf("127.0.0.1:%d", localPort)
 
-	tlsCfg, err := serverTLSConfig(ctx, clientset)
+	tlsCfg, err := serverTLSConfig(ctx, clientset, apiServerName())
 	if err != nil {
 		stopForward()
 		return nil, err
@@ -251,8 +263,9 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 	opts = append(opts, tokenOpt)
 
 	if traceEnabled {
-		opts = append(opts, grpc.WithUnaryInterceptor(newTraceInterceptor()))
+		opts = append(opts, grpc.WithChainUnaryInterceptor(newTraceInterceptor()))
 	}
+	opts = append(opts, extraOpts...)
 
 	conn, err := grpc.NewClient(localEndpoint, opts...)
 	if err != nil {
@@ -261,14 +274,20 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 	}
 
 	return &Client{
-		ControlClient: ateapipb.NewControlClient(conn),
+		ControlClient: ateapi.NewControlClient(conn),
 		conn:          conn,
 		cancel:        stopForward,
 	}, nil
 }
 
-func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.Config, error) {
-	ctbs, err := clientset.CertificatesV1beta1().ClusterTrustBundles().List(ctx, metav1.ListOptions{
+// serverTLSConfig verifies a Service's servicedns serving certificate for
+// serverName.
+func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface, serverName string) (*tls.Config, error) {
+	bundles, err := clustertrustbundle.NewClient(clientset, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover ClusterTrustBundle API: %w", err)
+	}
+	ctbs, err := bundles.List(ctx, metav1.ListOptions{
 		LabelSelector: liveBundleSelector,
 	})
 	if err != nil {
@@ -293,12 +312,16 @@ func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13,
 		RootCAs:    pool,
-		ServerName: apiServerName(),
+		ServerName: serverName,
 	}, nil
 }
 
 // bearerTokenDialOption attaches the configured token, or mints an ate-client
 // ServiceAccount token when tokenFile is empty.
+//
+// The minted token authenticates as FallbackPrincipal, not as whoever runs
+// the client: anyone Kubernetes RBAC lets create a token for that
+// ServiceAccount gets the same identity, and whatever it is granted.
 func bearerTokenDialOption(ctx context.Context, clientset *kubernetes.Clientset, tokenFile string) (grpc.DialOption, error) {
 	if tokenFile == "-" {
 		creds, err := readBearerToken(os.Stdin)

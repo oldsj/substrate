@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,20 +21,19 @@ import (
 
 	"sigs.k8s.io/yaml"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
 )
 
-// These tests pin the egress manifests to the Go constants the handler
+// These tests pin the egress manifest to the Go constants the handler
 // dispatches on and answers with. A chain renamed on one side only fails
 // closed at runtime, and nothing else in the tree would catch it.
 
 const (
-	extProcFilter        = "envoy.filters.http.ext_proc"
-	setFilterStateFilter = "envoy.filters.http.set_filter_state"
-	extProcServerCluster = "ext_proc_server"
-	passthroughCluster   = "egress_tcp_passthrough"
-	originalDstKey       = "envoy.network.transport_socket.original_dst_address"
-	dfpClusterType       = "envoy.clusters.dynamic_forward_proxy"
+	extProcFilter                  = "envoy.filters.http.ext_proc"
+	setFilterStateFilter           = "envoy.filters.http.set_filter_state"
+	extProcServerCluster           = "ext_proc_server"
+	passthroughForwardProxyCluster = "egress_forward_proxy_passthrough"
+	dfpClusterType                 = "envoy.clusters.dynamic_forward_proxy"
 )
 
 // requestLegs are the chains that decide per request and answer with a dial.
@@ -42,13 +41,14 @@ var requestLegs = []string{extproc.EgressCleartextFilterChainName, extproc.Egres
 
 type node = map[string]any
 
-// bootstrapTree parses the envoy.yaml of the atenet-egress ConfigMap in path
-// as a generic tree; the assertions read a few leaves scattered across it.
-func bootstrapTree(t *testing.T, path string) node {
+// bootstrapTree parses the envoy.yaml of the atenet-egress ConfigMap in
+// egressManifest as a generic tree; the assertions read a few leaves scattered
+// across it.
+func bootstrapTree(t *testing.T) node {
 	t.Helper()
 	var tree node
-	if err := yaml.Unmarshal([]byte(envoyConfig(t, path)), &tree); err != nil {
-		t.Fatalf("parsing envoy.yaml of %s: %v", path, err)
+	if err := yaml.Unmarshal([]byte(envoyConfig(t)), &tree); err != nil {
+		t.Fatalf("parsing envoy.yaml of %s: %v", egressManifest, err)
 	}
 	return tree
 }
@@ -162,34 +162,69 @@ func outerChain(t *testing.T, tree node) node {
 }
 
 // Every chain that calls ext_proc must be one the handler knows as an egress
-// leg, and each manifest must have exactly the legs its topology implies.
+// leg, and the manifest must have exactly the legs its topology implies.
 func TestEgressManifestsNameEveryExtProcChain(t *testing.T) {
-	want := map[string][]string{
-		egressManifests[0]: {extproc.EgressFilterChainName, extproc.EgressCleartextFilterChainName},
-		egressManifests[1]: {extproc.EgressFilterChainName, extproc.EgressTLSMITMFilterChainName, extproc.EgressCleartextFilterChainName},
+	want := []string{extproc.EgressFilterChainName, extproc.EgressTLSMITMFilterChainName, extproc.EgressCleartextFilterChainName}
+	var got []string
+	for _, lc := range allChains(bootstrapTree(t)) {
+		h := hcm(lc.chain)
+		if h == nil || filterIndex(list(h, "http_filters"), extProcFilter) < 0 {
+			continue
+		}
+		name := str(lc.chain, "name")
+		if !extproc.IsEgressFilterChain(name) {
+			t.Errorf("listener %q has a filter chain %q that calls ext_proc but is not a chain the egress handler serves; its callouts would be refused", str(lc.listener, "name"), name)
+		}
+		got = append(got, name)
 	}
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			var got []string
-			for _, lc := range allChains(bootstrapTree(t, path)) {
-				h := hcm(lc.chain)
-				if h == nil || filterIndex(list(h, "http_filters"), extProcFilter) < 0 {
-					continue
-				}
-				name := str(lc.chain, "name")
-				if !extproc.IsEgressFilterChain(name) {
-					t.Errorf("listener %q has a filter chain %q that calls ext_proc but is not a chain the egress handler serves; its callouts would be refused", str(lc.listener, "name"), name)
-				}
-				got = append(got, name)
-			}
-			slices.Sort(got)
-			expected := slices.Clone(want[path])
-			slices.Sort(expected)
-			if !slices.Equal(got, expected) {
-				t.Errorf("ext_proc-calling filter chains = %v, want %v", got, expected)
-			}
-		})
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("ext_proc-calling filter chains = %v, want %v", got, want)
 	}
+}
+
+func TestEgressManifestsDisableWebSocketUpgrades(t *testing.T) {
+	chains := list(mitmListener(t, bootstrapTree(t)), "filter_chains")
+	for _, name := range requestLegs {
+		chain := byName(chains, name)
+		if chain == nil {
+			t.Errorf("expected request-leg chain %q is absent", name)
+			continue
+		}
+		if !websocketDisabled(hcm(chain)) {
+			t.Errorf("chain %q must explicitly disable websocket upgrades", name)
+		}
+		var routes []node
+		for _, virtualHost := range list(child(hcm(chain), "route_config"), "virtual_hosts") {
+			routes = append(routes, list(virtualHost, "routes")...)
+		}
+		if len(routes) == 0 {
+			t.Errorf("chain %q has no routes", name)
+		}
+		for i, route := range routes {
+			action := child(route, "route")
+			if action == nil {
+				t.Errorf("chain %q route %d has no route action", name, i)
+				continue
+			}
+			if !websocketDisabled(action) {
+				t.Errorf("chain %q route %d must explicitly disable websocket upgrades", name, i)
+			}
+		}
+	}
+}
+
+// websocketDisabled reports whether n's upgrade_configs turn websocket off
+// explicitly.
+func websocketDisabled(n node) bool {
+	for _, upgrade := range list(n, "upgrade_configs") {
+		if str(upgrade, "upgrade_type") == "websocket" {
+			enabled, ok := upgrade["enabled"].(bool)
+			return ok && !enabled
+		}
+	}
+	return false
 }
 
 // extProcOf returns the ext_proc filter config of a chain's HCM and its index
@@ -209,352 +244,132 @@ func extProcOf(chain node) (node, int, []node) {
 func TestEgressManifestsExtProcFilters(t *testing.T) {
 	required := map[string][]string{
 		extproc.EgressFilterChainName:          {extproc.FilterChainNameAttribute},
-		extproc.EgressCleartextFilterChainName: {extproc.FilterChainNameAttribute, extproc.ActorIdentityFilterStateAttribute, extproc.OriginalDstIPAttribute, extproc.OriginalDstPortAttribute},
-		extproc.EgressTLSMITMFilterChainName:   {extproc.FilterChainNameAttribute, extproc.ActorIdentityFilterStateAttribute, extproc.OriginalDstIPAttribute, extproc.OriginalDstPortAttribute},
+		extproc.EgressCleartextFilterChainName: {extproc.FilterChainNameAttribute, extproc.ActorIdentityFilterStateAttribute, extproc.ConnectAuthorityFilterStateAttribute},
+		extproc.EgressTLSMITMFilterChainName:   {extproc.FilterChainNameAttribute, extproc.ActorIdentityFilterStateAttribute, extproc.ConnectAuthorityFilterStateAttribute, extproc.RequestedServerNameAttribute},
 	}
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			prefixes := map[string]string{} // stat_prefix -> chain
-			for _, lc := range allChains(bootstrapTree(t, path)) {
-				name := str(lc.chain, "name")
-				attrs, isLeg := required[name]
-				if !isLeg {
-					continue
-				}
-				cfg, i, filters := extProcOf(lc.chain)
-				if cfg == nil {
-					t.Errorf("chain %q has no ext_proc filter", name)
-					continue
-				}
-				if got := str(child(child(cfg, "grpc_service"), "envoy_grpc"), "cluster_name"); got != extProcServerCluster {
-					t.Errorf("chain %q ext_proc calls cluster %q, want %q", name, got, extProcServerCluster)
-				}
-				if allow, _ := cfg["failure_mode_allow"].(bool); allow {
-					t.Errorf("chain %q ext_proc has failure_mode_allow: true; a sidecar outage would let every request through", name)
-				}
-				if prefix := str(cfg, "stat_prefix"); prefix == "" {
-					t.Errorf("chain %q ext_proc has no stat_prefix; its failures would be indistinguishable from the other legs'", name)
-				} else if other, seen := prefixes[prefix]; seen {
-					t.Errorf("chain %q ext_proc reuses stat_prefix %q of chain %q; their stats would be summed", name, prefix, other)
-				} else {
-					prefixes[prefix] = name
-				}
-				got := strs(cfg, "request_attributes")
-				for _, attr := range attrs {
-					if !slices.Contains(got, attr) {
-						t.Errorf("chain %q ext_proc does not request %q; the handler would read it as absent and deny", name, attr)
-					}
-				}
-				// The decision has to come before the request is routed, and
-				// before dynamic_forward_proxy resolves the Host it names.
-				for _, later := range []string{"envoy.filters.http.dynamic_forward_proxy", "envoy.filters.http.router"} {
-					if j := filterIndex(filters, later); j >= 0 && j < i {
-						t.Errorf("chain %q runs %s before ext_proc", name, later)
-					}
-				}
-				// No leg rewrites routing: the name that was policed is the
-				// name that is dialed.
-				rules := child(cfg, "mutation_rules")
-				if isError, _ := rules["disallow_is_error"].(bool); !isError {
-					t.Errorf("chain %q ext_proc does not set mutation_rules.disallow_is_error", name)
-				}
-				routing, _ := rules["allow_all_routing"].(bool)
-				system, _ := rules["disallow_system"].(bool)
-				if !system || routing {
-					t.Errorf("chain %q ext_proc may rewrite routing headers (disallow_system=%v allow_all_routing=%v)", name, system, routing)
-				}
-				// Every leg answers with metadata in the egress namespace, the
-				// CONNECT leg's passthrough destination or a request leg's
-				// dial, and Envoy drops metadata from a namespace the filter
-				// does not admit.
-				admitted := strs(child(child(cfg, "metadata_options"), "receiving_namespaces"), "untyped")
-				if !slices.Contains(admitted, extproc.EgressMetadataNamespace) {
-					t.Errorf("chain %q ext_proc does not admit dynamic metadata in %q; its answer would be dropped", name, extproc.EgressMetadataNamespace)
-				}
+	prefixes := map[string]string{} // stat_prefix -> chain
+	for _, lc := range allChains(bootstrapTree(t)) {
+		name := str(lc.chain, "name")
+		attrs, isLeg := required[name]
+		if !isLeg {
+			continue
+		}
+		cfg, i, filters := extProcOf(lc.chain)
+		if cfg == nil {
+			t.Errorf("chain %q has no ext_proc filter", name)
+			continue
+		}
+		if got := str(child(child(cfg, "grpc_service"), "envoy_grpc"), "cluster_name"); got != extProcServerCluster {
+			t.Errorf("chain %q ext_proc calls cluster %q, want %q", name, got, extProcServerCluster)
+		}
+		if allow, _ := cfg["failure_mode_allow"].(bool); allow {
+			t.Errorf("chain %q ext_proc has failure_mode_allow: true; a sidecar outage would let every request through", name)
+		}
+		if prefix := str(cfg, "stat_prefix"); prefix == "" {
+			t.Errorf("chain %q ext_proc has no stat_prefix; its failures would be indistinguishable from the other legs'", name)
+		} else if other, seen := prefixes[prefix]; seen {
+			t.Errorf("chain %q ext_proc reuses stat_prefix %q of chain %q; their stats would be summed", name, prefix, other)
+		} else {
+			prefixes[prefix] = name
+		}
+		got := strs(cfg, "request_attributes")
+		for _, attr := range attrs {
+			if !slices.Contains(got, attr) {
+				t.Errorf("chain %q ext_proc does not request %q; the handler would read it as absent and deny", name, attr)
 			}
-		})
+		}
+		// The decision has to come before the request is routed, and
+		// before dynamic_forward_proxy resolves the Host it names.
+		for _, later := range []string{"envoy.filters.http.dynamic_forward_proxy", "envoy.filters.http.router"} {
+			if j := filterIndex(filters, later); j >= 0 && j < i {
+				t.Errorf("chain %q runs %s before ext_proc", name, later)
+			}
+		}
+		// No leg rewrites routing: the name that was policed is the
+		// name that is dialed.
+		rules := child(cfg, "mutation_rules")
+		if isError, _ := rules["disallow_is_error"].(bool); !isError {
+			t.Errorf("chain %q ext_proc does not set mutation_rules.disallow_is_error", name)
+		}
+		routing, _ := rules["allow_all_routing"].(bool)
+		system, _ := rules["disallow_system"].(bool)
+		if !system || routing {
+			t.Errorf("chain %q ext_proc may rewrite routing headers (disallow_system=%v allow_all_routing=%v)", name, system, routing)
+		}
+		// Every leg answers with metadata in the egress namespace, the
+		// CONNECT leg's dialed port or a request leg's dial, and Envoy
+		// drops metadata from a namespace the filter does not admit.
+		admitted := strs(child(child(cfg, "metadata_options"), "receiving_namespaces"), "untyped")
+		if !slices.Contains(admitted, extproc.EgressMetadataNamespace) {
+			t.Errorf("chain %q ext_proc does not admit dynamic metadata in %q; its answer would be dropped", name, extproc.EgressMetadataNamespace)
+		}
 	}
 }
 
-// The CONNECT leg's answer is the only source of the address the passthrough
-// chain dials: the outer chain copies it into the ORIGINAL_DST filter state
-// after ext_proc ran and writes nothing when there was no address.
-func TestEgressManifestsConnectLegDecidesThePassthroughDestination(t *testing.T) {
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			tree := bootstrapTree(t, path)
-
-			// One writer in the whole bootstrap: a second one could put back
-			// an address the CONNECT leg withheld, since skip_if_empty would
-			// not overwrite it.
-			writers := filterStateWriters(tree, originalDstKey)
-			if len(writers) != 1 {
-				t.Fatalf("%s is set by %d filters; only the CONNECT leg's answer may set it", originalDstKey, len(writers))
+// The identity and the dialed authority cross the inner hop as filter state
+// shared with the upstream; nothing else carries them.
+func TestEgressManifestsShareIdentityWithTheInnerListener(t *testing.T) {
+	var identity, authority node
+	for _, f := range list(hcm(outerChain(t, bootstrapTree(t))), "http_filters") {
+		if str(f, "name") != setFilterStateFilter {
+			continue
+		}
+		for _, v := range list(child(f, "typed_config"), "on_request_headers") {
+			switch str(v, "object_key") {
+			case extproc.ActorIdentityFilterStateKey:
+				identity = v
+			case extproc.ConnectAuthorityFilterStateKey:
+				authority = v
 			}
-
-			filters := list(hcm(outerChain(t, tree)), "http_filters")
-			extProcAt := filterIndex(filters, extProcFilter)
-			var entry node
-			for i, f := range filters {
-				if str(f, "name") != setFilterStateFilter {
-					continue
-				}
-				for _, v := range list(child(f, "typed_config"), "on_request_headers") {
-					if str(v, "object_key") != originalDstKey {
-						continue
-					}
-					if i < extProcAt {
-						t.Errorf("%s is set at http_filters[%d], before ext_proc at [%d]; the metadata it reads does not exist yet", originalDstKey, i, extProcAt)
-					}
-					entry = v
-				}
-			}
-			if entry == nil {
-				t.Fatalf("the one writer of %s is not on the outer chain, where the metadata is", originalDstKey)
-			}
-			format := child(entry, "format_string")
-			if got := str(child(format, "text_format_source"), "inline_string"); got != extproc.EgressPassthroughDestinationFormat {
-				t.Errorf("%s is set from %q, want %q", originalDstKey, got, extproc.EgressPassthroughDestinationFormat)
-			}
-			if omit, _ := format["omit_empty_values"].(bool); !omit {
-				t.Errorf("%s format does not omit empty values; an absent answer would render as \"-\"", originalDstKey)
-			}
-			if skip, _ := entry["skip_if_empty"].(bool); !skip {
-				t.Errorf("%s is not skip_if_empty; an absent answer would be written as an unparseable address", originalDstKey)
-			}
-			if str(entry, "shared_with_upstream") == "" {
-				t.Errorf("%s is not shared with upstream; the passthrough chain would never see it", originalDstKey)
-			}
-		})
+		}
 	}
-}
-
-// Every inner chain without an HCM is a passthrough chain: a plain tcp_proxy
-// to the ORIGINAL_DST cluster, dialing the filter state the CONNECT leg's
-// answer produced and nothing else. The plain gateway needs one per transport
-// protocol; on sdsmint egress_tls_mitm claims tls, so only raw_buffer is left.
-// See TestEgressManifestsClaimEveryTransportProtocol.
-var wantPassthroughChains = map[string][]string{
-	egressManifests[0]: {"egress_passthrough", "egress_tls_passthrough"},
-	egressManifests[1]: {"egress_passthrough"},
-}
-
-func TestEgressManifestsPassthroughChainDialsOnlyTheDecidedAddress(t *testing.T) {
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			tree := bootstrapTree(t, path)
-			var passthrough []string
-			for _, lc := range allChains(tree) {
-				if hcm(lc.chain) != nil || str(lc.listener, "name") == "egress" {
-					continue
-				}
-				name := str(lc.chain, "name")
-				filters := list(lc.chain, "filters")
-				if len(filters) != 1 || str(filters[0], "name") != "envoy.filters.network.tcp_proxy" {
-					t.Errorf("non-HTTP chain %q must be a single tcp_proxy, got %d filters", name, len(filters))
-					continue
-				}
-				proxy := child(filters[0], "typed_config")
-				if got := str(proxy, "cluster"); got != passthroughCluster {
-					t.Errorf("chain %q tcp_proxy dials %q, want %q", name, got, passthroughCluster)
-				}
-				if proxy["tunneling_config"] != nil {
-					t.Errorf("chain %q wraps the connection in a CONNECT; the passthrough chain relays bytes as they are", name)
-				}
-				passthrough = append(passthrough, name)
-			}
-			slices.Sort(passthrough)
-			if want := wantPassthroughChains[path]; !slices.Equal(passthrough, want) {
-				t.Fatalf("passthrough chains = %v, want %v", passthrough, want)
-			}
-
-			cluster := byName(clusters(tree), passthroughCluster)
-			if cluster == nil {
-				t.Fatalf("no %s cluster", passthroughCluster)
-			}
-			if got := str(cluster, "type"); got != "ORIGINAL_DST" {
-				t.Errorf("%s is of type %q, want ORIGINAL_DST", passthroughCluster, got)
-			}
-			// The filter state is the one input. A header or metadata override
-			// would be a second way to pick the address.
-			if lb := child(cluster, "original_dst_lb_config"); len(lb) != 0 {
-				t.Errorf("%s has original_dst_lb_config %v; the address must come from the filter state alone", passthroughCluster, lb)
-			}
-			if cluster["transport_socket"] != nil {
-				t.Errorf("%s has a transport socket; the payload is the actor's own bytes and must not be wrapped", passthroughCluster)
-			}
-			for _, c := range clusters(tree) {
-				if strings.Contains(mustJSON(t, c), "dynamic_forward_proxy") && !strings.Contains(mustJSON(t, c), `"typed_extension_protocol_options"`) {
-					t.Errorf("cluster %q is a dynamic forward proxy without HTTP protocol options; a raw by-name dial has no leg to authorize it", str(c, "name"))
-				}
-			}
-		})
+	if identity == nil {
+		t.Fatalf("the egress chain never sets %s", extproc.ActorIdentityFilterStateKey)
 	}
-}
-
-// Envoy buckets a listener's filter chains by transport protocol and never
-// falls back out of a populated bucket. egress_cleartext claims raw_buffer
-// with HTTP application protocols alone, so a chain that matches nothing is
-// unreachable and every opaque or unclassified connection is closed as
-// no_filter_chain_match, allowed or not.
-//
-// The inner listener's filters produce exactly two transport protocols: tls
-// from tls_inspector, and raw_buffer for everything else, sniff timeout
-// included. Each needs a chain with no application_protocols as its catch-all.
-// Every ORIGINAL_DST cluster, the by-address routes' included, dials the
-// filter state alone. A metadata_key, use_http_header or port_override would
-// give a request a way to name an address other than the one the CONNECT leg
-// allowed and the request legs policed.
-func TestEgressManifestsOriginalDstClustersDialTheFilterStateAlone(t *testing.T) {
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			tree := bootstrapTree(t, path)
-			found := 0
-			for _, cluster := range clusters(tree) {
-				if str(cluster, "type") != "ORIGINAL_DST" {
-					continue
-				}
-				found++
-				if lb := child(cluster, "original_dst_lb_config"); len(lb) != 0 {
-					t.Errorf("cluster %q has original_dst_lb_config %v; the address must come from the filter state alone", str(cluster, "name"), lb)
-				}
-			}
-			if found < 2 {
-				t.Errorf("found %d ORIGINAL_DST clusters, want at least the passthrough and the by-address ones", found)
-			}
-		})
+	if got := str(identity, "shared_with_upstream"); got == "" {
+		t.Errorf("%s is not shared with upstream; the inner legs would see no actor", extproc.ActorIdentityFilterStateKey)
 	}
-}
-
-func TestEgressManifestsClaimEveryTransportProtocol(t *testing.T) {
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			for _, l := range listeners(bootstrapTree(t, path)) {
-				if str(l, "name") == "egress" {
-					continue
-				}
-				catchAll := map[string][]string{}
-				for _, c := range list(l, "filter_chains") {
-					name := str(c, "name")
-					match := child(c, "filter_chain_match")
-					transport := str(match, "transport_protocol")
-					if transport == "" {
-						t.Errorf("chain %q matches no transport protocol, so it is only reachable when no chain claims the connection's own; give it one", name)
-						continue
-					}
-					if _, seen := catchAll[transport]; !seen {
-						catchAll[transport] = nil
-					}
-					if len(strs(match, "application_protocols")) == 0 {
-						catchAll[transport] = append(catchAll[transport], name)
-					}
-				}
-				for _, transport := range []string{"tls", "raw_buffer"} {
-					names, claimed := catchAll[transport]
-					if !claimed {
-						t.Errorf("listener %q has no chain matching transport protocol %q; a connection the listener filters classify that way is closed as no_filter_chain_match", str(l, "name"), transport)
-						continue
-					}
-					if len(names) != 1 {
-						t.Errorf("listener %q has %d chains matching %q with no application_protocols (%v), want exactly one to catch what the inspectors could not name", str(l, "name"), len(names), transport, names)
-					}
-				}
-				for transport := range catchAll {
-					if transport != "tls" && transport != "raw_buffer" {
-						t.Errorf("listener %q has a chain matching transport protocol %q, which its listener filters never set", str(l, "name"), transport)
-					}
-				}
-			}
-		})
+	// The dialed port rides along the same way; without it the request
+	// legs cannot enforce a rule's ports.
+	if authority == nil {
+		t.Fatalf("the egress chain never sets %s", extproc.ConnectAuthorityFilterStateKey)
 	}
-}
-
-// The identity crosses the inner hop as filter state, which internal_upstream
-// copies from the options the connection pool was created with. A string
-// object is not part of the pool key, so the outer HCM keys the pool per actor
-// itself, and must not share that key upstream as an SNI override.
-func TestEgressManifestsKeyTheInnerPoolPerActor(t *testing.T) {
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			var identity, poolKey node
-			for _, f := range list(hcm(outerChain(t, bootstrapTree(t, path))), "http_filters") {
-				if str(f, "name") != setFilterStateFilter {
-					continue
-				}
-				for _, v := range list(child(f, "typed_config"), "on_request_headers") {
-					switch str(v, "object_key") {
-					case extproc.ActorIdentityFilterStateKey:
-						identity = v
-					case "envoy.network.upstream_server_name":
-						poolKey = v
-					}
-				}
-			}
-			if identity == nil {
-				t.Fatalf("the egress chain never sets %s", extproc.ActorIdentityFilterStateKey)
-			}
-			if got := str(identity, "shared_with_upstream"); got == "" {
-				t.Errorf("%s is not shared with upstream; the inner legs would see no actor", extproc.ActorIdentityFilterStateKey)
-			}
-			if poolKey == nil {
-				t.Fatal("the egress chain does not key the inner pool per actor (no envoy.network.upstream_server_name entry)")
-			}
-			if str(poolKey, "shared_with_upstream") != "" {
-				t.Error("envoy.network.upstream_server_name must not be shared with upstream; it would override the SNI of re-originated TLS")
-			}
-			if !strings.Contains(mustJSON(t, poolKey), "DOWNSTREAM_PEER_URI_SAN") {
-				t.Error("the pool key must derive from the verified peer certificate")
-			}
-		})
+	if got := str(authority, "shared_with_upstream"); got == "" {
+		t.Errorf("%s is not shared with upstream; the inner legs would see no dialed port", extproc.ConnectAuthorityFilterStateKey)
 	}
 }
 
 // http_inspector steers HTTP/1.0 onto the cleartext chain; the codec has to
 // accept it there, or those requests fail before any filter runs, unlogged.
 func TestEgressManifestsCleartextAcceptsHTTP10(t *testing.T) {
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			for _, lc := range allChains(bootstrapTree(t, path)) {
-				if str(lc.chain, "name") != extproc.EgressCleartextFilterChainName {
-					continue
-				}
-				if ok, _ := child(hcm(lc.chain), "http_protocol_options")["accept_http_10"].(bool); !ok {
-					t.Errorf("%s does not accept HTTP/1.0", extproc.EgressCleartextFilterChainName)
-				}
-			}
-		})
-	}
-}
-
-// One tunnel per inner connection: the filter state internal_upstream copies
-// belongs to the tunnel the connection was made for, and a reused connection
-// would carry it into the next one.
-func TestEgressManifestsNeverReuseATunnelConnection(t *testing.T) {
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			for _, cluster := range clusters(bootstrapTree(t, path)) {
-				if !strings.Contains(mustJSON(t, cluster), `"server_listener_name"`) {
-					continue
-				}
-				if got := maxRequestsPerConnection(child(cluster, "typed_extension_protocol_options")); got != 1 {
-					t.Errorf("internal cluster %q allows %v requests per connection, want 1", str(cluster, "name"), got)
-				}
-			}
-		})
-	}
-}
-
-// maxRequestsPerConnection reads the limit out of a cluster's
-// HttpProtocolOptions, or 0 when there is none.
-func maxRequestsPerConnection(opts node) float64 {
-	for _, v := range opts {
-		if m, ok := v.(node); ok {
-			if n, ok := child(m, "common_http_protocol_options")["max_requests_per_connection"].(float64); ok {
-				return n
-			}
+	for _, lc := range allChains(bootstrapTree(t)) {
+		if str(lc.chain, "name") != extproc.EgressCleartextFilterChainName {
+			continue
+		}
+		if ok, _ := child(hcm(lc.chain), "http_protocol_options")["accept_http_10"].(bool); !ok {
+			t.Errorf("%s does not accept HTTP/1.0", extproc.EgressCleartextFilterChainName)
 		}
 	}
-	return 0
+}
+
+// A connection no tunnel holds keeps its inner pool alive until the idle
+// timeout, which must not be disabled.
+func TestEgressManifestsTimeOutIdleInnerConnections(t *testing.T) {
+	tree := bootstrapTree(t)
+	internal := 0
+	for _, cluster := range clusters(tree) {
+		if !strings.Contains(mustJSON(t, cluster), `"server_listener_name"`) {
+			continue
+		}
+		internal++
+		tcp := child(child(cluster, "typed_extension_protocol_options"), "envoy.extensions.upstreams.tcp.v3.TcpProtocolOptions")
+		if got := str(tcp, "idle_timeout"); got == "" || strings.Trim(got, "0.s") == "" {
+			t.Errorf("internal cluster %q idle_timeout is %q; want a non-zero timeout so a pool its tunnel left behind is freed", str(cluster, "name"), got)
+		}
+	}
+	if internal == 0 {
+		t.Fatal("no cluster targets an internal listener")
+	}
 }
 
 // dialMatchOf returns the dial a route's match requires, or "" when it
@@ -570,6 +385,23 @@ func dialMatchOf(match node) string {
 		return str(child(child(m, "value"), "string_match"), "exact")
 	}
 	return ""
+}
+
+// requiresDialHost reports whether a route matches only when the answer
+// carries the name to dial.
+func requiresDialHost(match node) bool {
+	for _, m := range list(match, "dynamic_metadata") {
+		if str(m, "filter") != extproc.EgressMetadataNamespace {
+			continue
+		}
+		if segs := list(m, "path"); len(segs) != 1 || str(segs[0], "key") != extproc.EgressDialHostKey {
+			continue
+		}
+		if present, _ := child(m, "value")["present_match"].(bool); present {
+			return true
+		}
+	}
+	return false
 }
 
 // autoSNIAndSAN reports whether a cluster takes the SNI and the certificate
@@ -588,64 +420,102 @@ func autoSNIAndSAN(cluster node) bool {
 	return false
 }
 
-// A request leg's answer picks its route: one route per dial and no default,
-// so a request the sidecar did not answer for has no route. dial=name goes to
-// a dynamic forward proxy cluster, which resolves the Host; dial=address to an
-// ORIGINAL_DST cluster fed by the same filter state as the passthrough chains.
-// On the MITM leg both re-originate TLS and verify the origin against the Host;
-// on the cleartext leg neither wraps the actor's plaintext.
+// A request leg's answer picks its route: every route matches dial=name and
+// there is no default, so a request the sidecar did not answer for has no
+// route. The route goes to a dynamic forward proxy cluster, and only with the
+// answered name it dials. On the MITM leg it re-originates TLS and verifies
+// the origin against the Host; on the cleartext leg it does not wrap the
+// actor's plaintext.
 func TestEgressManifestsRequestLegsRouteByTheDial(t *testing.T) {
-	for _, path := range egressManifests {
-		t.Run(path, func(t *testing.T) {
-			tree := bootstrapTree(t, path)
-			all := clusters(tree)
-			for _, lc := range allChains(tree) {
-				name := str(lc.chain, "name")
-				if !slices.Contains(requestLegs, name) {
+	tree := bootstrapTree(t)
+	all := clusters(tree)
+	for _, lc := range allChains(tree) {
+		name := str(lc.chain, "name")
+		if !slices.Contains(requestLegs, name) {
+			continue
+		}
+		routes := 0
+		for _, vh := range list(child(hcm(lc.chain), "route_config"), "virtual_hosts") {
+			for _, r := range list(vh, "routes") {
+				clusterName := str(child(r, "route"), "cluster")
+				cluster := byName(all, clusterName)
+				if cluster == nil {
+					t.Errorf("chain %q routes to cluster %q, which does not exist", name, clusterName)
 					continue
 				}
-				dials := map[string]int{}
-				for _, vh := range list(child(hcm(lc.chain), "route_config"), "virtual_hosts") {
-					for _, r := range list(vh, "routes") {
-						dial := dialMatchOf(child(r, "match"))
-						clusterName := str(child(r, "route"), "cluster")
-						cluster := byName(all, clusterName)
-						if cluster == nil {
-							t.Errorf("chain %q routes to cluster %q, which does not exist", name, clusterName)
-							continue
-						}
-						dials[dial]++
-						switch dial {
-						case extproc.EgressDialName:
-							if got := str(child(cluster, "cluster_type"), "name"); got != dfpClusterType {
-								t.Errorf("chain %q sends dial=name to %q of type %q, want a dynamic forward proxy", name, clusterName, got)
-							}
-						case extproc.EgressDialAddress:
-							if got := str(cluster, "type"); got != "ORIGINAL_DST" {
-								t.Errorf("chain %q sends dial=address to %q of type %q, want ORIGINAL_DST", name, clusterName, got)
-							}
-							if lb := child(cluster, "original_dst_lb_config"); len(lb) != 0 {
-								t.Errorf("cluster %q has original_dst_lb_config %v; the address must come from the filter state alone", clusterName, lb)
-							}
-						default:
-							t.Errorf("chain %q has a route to %q that matches no dial; a request the sidecar did not answer for would take it", name, clusterName)
-						}
-						tls := cluster["transport_socket"] != nil
-						if name == extproc.EgressTLSMITMFilterChainName && (!tls || !autoSNIAndSAN(cluster)) {
-							t.Errorf("chain %q routes to %q, which does not re-originate TLS with the SNI and certificate check taken from the Host", name, clusterName)
-						}
-						if name == extproc.EgressCleartextFilterChainName && tls {
-							t.Errorf("chain %q routes to %q, which wraps the actor's plaintext in TLS", name, clusterName)
-						}
-					}
+				routes++
+				if dial := dialMatchOf(child(r, "match")); dial != extproc.EgressDialName {
+					t.Errorf("chain %q has a route to %q matching dial=%q, want %q; a request the sidecar did not answer for would take it", name, clusterName, dial, extproc.EgressDialName)
 				}
-				for _, dial := range []string{extproc.EgressDialName, extproc.EgressDialAddress} {
-					if dials[dial] == 0 {
-						t.Errorf("chain %q has no route for dial=%s", name, dial)
-					}
+				if got := str(child(cluster, "cluster_type"), "name"); got != dfpClusterType {
+					t.Errorf("chain %q sends dial=name to %q of type %q, want a dynamic forward proxy", name, clusterName, got)
+				}
+				if !requiresDialHost(child(r, "match")) {
+					t.Errorf("chain %q sends dial=name to %q without requiring %s:%s; an answer without the name would dial the Host's port", name, clusterName, extproc.EgressMetadataNamespace, extproc.EgressDialHostKey)
+				}
+				tls := cluster["transport_socket"] != nil
+				if name == extproc.EgressTLSMITMFilterChainName && (!tls || !autoSNIAndSAN(cluster)) {
+					t.Errorf("chain %q routes to %q, which does not re-originate TLS with the SNI and certificate check taken from the Host", name, clusterName)
+				}
+				if name == extproc.EgressCleartextFilterChainName && tls {
+					t.Errorf("chain %q routes to %q, which wraps the actor's plaintext in TLS", name, clusterName)
 				}
 			}
-		})
+		}
+		if routes == 0 {
+			t.Errorf("chain %q has no route for dial=%s", name, extproc.EgressDialName)
+		}
+	}
+}
+
+// Each request leg dials the name its answer carries, on the port the actor
+// dialed: a set_filter_state between ext_proc and the forward proxy filter
+// copies the answer into the dynamic host, which the forward proxy cluster
+// dials in place of the Host. Without it, the cluster dials a port in the Host
+// that no rule checked. The filter resolves that same entry ahead of the
+// cluster only with allow_dynamic_host_from_filter_state; without it, it
+// resolves the Host as sent, into the DNS cache all actors share.
+func TestEgressManifestsRequestLegsDialTheAnsweredName(t *testing.T) {
+	tree := bootstrapTree(t)
+	if writers := filterStateWriters(tree, extproc.UpstreamDynamicHostFilterStateKey); len(writers) != len(requestLegs) {
+		t.Errorf("%s is set by %d filters, want one per request leg", extproc.UpstreamDynamicHostFilterStateKey, len(writers))
+	}
+	for _, leg := range requestLegs {
+		chain := byName(list(mitmListener(t, tree), "filter_chains"), leg)
+		if chain == nil {
+			t.Fatalf("no %q chain on mitm_listener", leg)
+		}
+		_, extProcAt, filters := extProcOf(chain)
+		forwardProxyAt := filterIndex(filters, "envoy.filters.http.dynamic_forward_proxy")
+		if forwardProxyAt < 0 {
+			t.Errorf("chain %q has no dynamic_forward_proxy filter", leg)
+			continue
+		}
+		if allow, _ := child(filters[forwardProxyAt], "typed_config")["allow_dynamic_host_from_filter_state"].(bool); !allow {
+			t.Errorf("chain %q's dynamic_forward_proxy resolves the Host as sent, not %s, so every port and spelling of a Host takes a DNS cache slot", leg, extproc.UpstreamDynamicHostFilterStateKey)
+		}
+		var entry node
+		at := -1
+		for i, f := range filters {
+			if str(f, "name") != setFilterStateFilter {
+				continue
+			}
+			for _, v := range list(child(f, "typed_config"), "on_request_headers") {
+				if str(v, "object_key") == extproc.UpstreamDynamicHostFilterStateKey {
+					entry, at = v, i
+				}
+			}
+		}
+		if at < 0 {
+			t.Errorf("chain %q does not set %s", leg, extproc.UpstreamDynamicHostFilterStateKey)
+			continue
+		}
+		if at < extProcAt || at > forwardProxyAt {
+			t.Errorf("chain %q sets %s at http_filters[%d], want it between ext_proc at [%d] and dynamic_forward_proxy at [%d]", leg, extproc.UpstreamDynamicHostFilterStateKey, at, extProcAt, forwardProxyAt)
+		}
+		if got := str(child(child(entry, "format_string"), "text_format_source"), "inline_string"); got != extproc.EgressDialHostFormat {
+			t.Errorf("chain %q sets %s from %q, want %q", leg, extproc.UpstreamDynamicHostFilterStateKey, got, extproc.EgressDialHostFormat)
+		}
 	}
 }
 
@@ -660,4 +530,300 @@ func mustJSON(t *testing.T, n node) string {
 		t.Fatalf("to json: %v", err)
 	}
 	return string(j)
+}
+
+// mitmListener returns the egress manifest's inner listener.
+func mitmListener(t *testing.T, tree node) node {
+	t.Helper()
+	l := byName(listeners(tree), "mitm_listener")
+	if l == nil {
+		t.Fatal("no mitm_listener in the egress manifest")
+	}
+	return l
+}
+
+// The matcher must select on the module's verdict and map every verdict, with
+// "denied" mapping to no chain. The module runs after both inspectors, and no
+// chain keeps a filter_chain_match, which Envoy ignores once a matcher is set.
+func TestEgressManifestsInnerListenerSelectsOnTheModuleVerdict(t *testing.T) {
+	tree := bootstrapTree(t)
+	l := mitmListener(t, tree)
+
+	filters := list(l, "listener_filters")
+	module := filterIndex(filters, "envoy.filters.listener.dynamic_modules")
+	if module < 0 {
+		t.Fatal("mitm_listener has no dynamic_modules listener filter; nothing would write the verdict")
+	}
+	for _, inspector := range []string{"envoy.filters.listener.tls_inspector", "envoy.filters.listener.http_inspector"} {
+		if i := filterIndex(filters, inspector); i < 0 || i > module {
+			t.Errorf("%s is at listener_filters[%d], the egress-policy module at [%d]; the module would see no transport protocol or SNI", inspector, i, module)
+		}
+	}
+
+	matcherTree := child(child(l, "filter_chain_matcher"), "matcher_tree")
+	if got := str(child(child(matcherTree, "input"), "typed_config"), "key"); got != extproc.EgressFilterChainFilterStateKey {
+		t.Errorf("filter_chain_matcher keys on filter state %q, want %q", got, extproc.EgressFilterChainFilterStateKey)
+	}
+	actions := child(child(matcherTree, "exact_match_map"), "map")
+
+	chains := map[string]bool{}
+	for _, c := range list(l, "filter_chains") {
+		chains[str(c, "name")] = true
+		if child(c, "filter_chain_match") != nil {
+			t.Errorf("chain %q has a filter_chain_match, which Envoy ignores when the listener has a filter_chain_matcher", str(c, "name"))
+		}
+	}
+	for verdict, want := range map[string]string{
+		extproc.EgressFilterChainMITM:        extproc.EgressTLSMITMFilterChainName,
+		extproc.EgressFilterChainCleartext:   extproc.EgressCleartextFilterChainName,
+		extproc.EgressFilterChainPassthrough: "egress_passthrough",
+	} {
+		got := str(child(child(child(actions, verdict), "action"), "typed_config"), "value")
+		if got != want {
+			t.Errorf("verdict %q selects chain %q, want %q", verdict, got, want)
+		}
+		if !chains[got] {
+			t.Errorf("verdict %q selects chain %q, which the listener does not have; the connection would be closed", verdict, got)
+		}
+	}
+	if action := child(child(actions, extproc.EgressFilterChainDenied), "action"); action != nil {
+		if got := str(child(action, "typed_config"), "value"); chains[got] {
+			t.Errorf("verdict %q selects chain %q; a denied connection must match no chain", extproc.EgressFilterChainDenied, got)
+		}
+	}
+}
+
+// The outer ext_proc must accept dev.ate.policy.egress, and the outer chain
+// must copy the policy's hash after ext_proc into filter state shared with the
+// inner listener, where the module looks the rules up by it.
+func TestEgressManifestsConnectLegHandsTheSNIRulesHashToTheInnerListener(t *testing.T) {
+	tree := bootstrapTree(t)
+	outer := outerChain(t, tree)
+	cfg, extProcAt, filters := extProcOf(outer)
+	if cfg == nil {
+		t.Fatalf("chain %q has no ext_proc filter", extproc.EgressFilterChainName)
+	}
+	admitted := strs(child(child(cfg, "metadata_options"), "receiving_namespaces"), "untyped")
+	if !slices.Contains(admitted, extproc.EgressPolicyMetadataNamespace) {
+		t.Errorf("the CONNECT leg's ext_proc does not admit dynamic metadata in %q; the SNI rules would be dropped and every ClientHello denied", extproc.EgressPolicyMetadataNamespace)
+	}
+
+	writers := filterStateWriters(tree, extproc.EgressPolicyHashFilterStateKey)
+	if len(writers) != 1 {
+		t.Fatalf("%s is set by %d filters, want exactly the CONNECT leg's copy of its answer", extproc.EgressPolicyHashFilterStateKey, len(writers))
+	}
+	entry := writers[0]
+	var gotKeys []string
+	var sharedTransitivelyKeys []string
+	actionsByKey := map[string]node{}
+	at := -1
+	for i, f := range filters {
+		if str(f, "name") != setFilterStateFilter {
+			continue
+		}
+		for _, v := range list(child(f, "typed_config"), "on_request_headers") {
+			key := str(v, "object_key")
+			gotKeys = append(gotKeys, key)
+			actionsByKey[key] = v
+			if key == extproc.EgressPolicyHashFilterStateKey {
+				at = i
+			}
+			got := str(v, "shared_with_upstream")
+			if got == "TRANSITIVE" {
+				sharedTransitivelyKeys = append(sharedTransitivelyKeys, key)
+			} else if got != "ONCE" {
+				t.Errorf("%s has shared_with_upstream %q, want ONCE or TRANSITIVE", key, got)
+			}
+		}
+	}
+	// Verify that expected state is shared with the upstream.
+	wantKeys := []string{
+		extproc.ActorIdentityFilterStateKey,
+		extproc.ConnectAuthorityFilterStateKey,
+		extproc.UpstreamDynamicPortFilterStateKey,
+		extproc.EgressPolicyHashFilterStateKey,
+	}
+	if !slices.Equal(gotKeys, wantKeys) {
+		t.Errorf("outer chain set_filter_state actions write keys %v, want %v", gotKeys, wantKeys)
+	}
+	// These keys allow origin pools to be partitioned per actor:port combination.
+	wantSharedTransitivelyKeys := []string{
+		extproc.ActorIdentityFilterStateKey,
+		extproc.ConnectAuthorityFilterStateKey,
+	}
+	if !slices.Equal(sharedTransitivelyKeys, wantSharedTransitivelyKeys) {
+		t.Errorf("outer chain set_filter_state TRANSITIVE keys %v, want %v", sharedTransitivelyKeys, wantSharedTransitivelyKeys)
+	}
+	// These keys determine pool selection and their values are bound to the pool at the
+	// time of pool creation. All CONNECT tunnels that have the same values for these filter
+	// state keys share a pool.
+	for _, key := range []string{
+		extproc.ActorIdentityFilterStateKey,
+		extproc.ConnectAuthorityFilterStateKey,
+		extproc.EgressPolicyHashFilterStateKey,
+	} {
+		// Make sure factory creates hashable filter state objects, so it impacts pool selection.
+		if got := str(actionsByKey[key], "factory_key"); got != "envoy.hashable_string" {
+			t.Errorf("%s uses factory %q, want envoy.hashable_string", key, got)
+		}
+	}
+	if at < 0 {
+		t.Fatalf("the writer of %s is not on the outer chain, where the answer is", extproc.EgressPolicyHashFilterStateKey)
+	}
+	if at < extProcAt {
+		t.Errorf("%s is set at http_filters[%d], before ext_proc at [%d]; the metadata it reads does not exist yet", extproc.EgressPolicyHashFilterStateKey, at, extProcAt)
+	}
+	format := child(entry, "format_string")
+	if got := str(child(format, "text_format_source"), "inline_string"); got != extproc.EgressPolicyHashFormat {
+		t.Errorf("%s is set from %q, want %q", extproc.EgressPolicyHashFilterStateKey, got, extproc.EgressPolicyHashFormat)
+	}
+	if skip, _ := entry["skip_if_empty"].(bool); !skip {
+		t.Errorf("%s is not skip_if_empty; an absent hash would be written as an empty one", extproc.EgressPolicyHashFilterStateKey)
+	}
+}
+
+// Denied connections match no chain, so the listener access log is their only
+// record. It must log only NR connections and include the SNI, actor, and
+// verdict.
+func TestEgressManifestsInnerListenerLogsDeniedConnections(t *testing.T) {
+	tree := bootstrapTree(t)
+	logs := list(mitmListener(t, tree), "access_log")
+	if len(logs) == 0 {
+		t.Fatal("mitm_listener has no access_log; a ClientHello the module denies would leave no record")
+	}
+	for i, al := range logs {
+		if flags := strs(child(child(al, "filter"), "response_flag_filter"), "flags"); !slices.Contains(flags, "NR") {
+			t.Errorf("access_log[%d] is not confined to response flag NR (got %v); it would log every connection the chains already log", i, flags)
+		}
+		format := child(child(child(al, "typed_config"), "log_format"), "json_format")
+		for _, want := range []string{
+			"%REQUESTED_SERVER_NAME%",
+			"%FILTER_STATE(" + extproc.ActorIdentityFilterStateKey + ":PLAIN)%",
+			"%FILTER_STATE(" + extproc.EgressFilterChainFilterStateKey + ":PLAIN)%",
+		} {
+			found := false
+			for _, v := range format {
+				if s, ok := v.(string); ok && strings.Contains(s, want) {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("access_log[%d] does not log %s", i, want)
+			}
+		}
+	}
+}
+
+// The sdsmint passthrough chain relays TLS unread to the resolved SNI on the
+// port the actor dialed: sni_dynamic_forward_proxy resolves the name and
+// tcp_proxy dials it through a raw forward-proxy cluster. The address the
+// actor dialed must have no way in, and only this chain may dial the raw
+// cluster, since nothing else authorizes a by-name dial without a request leg.
+func TestEgressManifestsPassthroughChainDialsTheResolvedSNI(t *testing.T) {
+	tree := bootstrapTree(t)
+	chain := byName(list(mitmListener(t, tree), "filter_chains"), "egress_passthrough")
+	if chain == nil {
+		t.Fatal("no egress_passthrough chain on mitm_listener")
+	}
+	filters := list(chain, "filters")
+	if len(filters) != 2 || str(filters[0], "name") != "envoy.filters.network.sni_dynamic_forward_proxy" || str(filters[1], "name") != "envoy.filters.network.tcp_proxy" {
+		names := make([]string, len(filters))
+		for i, f := range filters {
+			names[i] = str(f, "name")
+		}
+		t.Fatalf("egress_passthrough filters = %v, want sni_dynamic_forward_proxy then tcp_proxy", names)
+	}
+	sni := child(filters[0], "typed_config")
+	proxy := child(filters[1], "typed_config")
+	if got := str(proxy, "cluster"); got != passthroughForwardProxyCluster {
+		t.Errorf("egress_passthrough tcp_proxy dials %q, want %q", got, passthroughForwardProxyCluster)
+	}
+	if proxy["tunneling_config"] != nil {
+		t.Error("egress_passthrough wraps the connection in a CONNECT; it relays bytes as they are")
+	}
+
+	cluster := byName(clusters(tree), passthroughForwardProxyCluster)
+	if cluster == nil {
+		t.Fatalf("no %s cluster", passthroughForwardProxyCluster)
+	}
+	clusterType := child(child(cluster, "cluster_type"), "typed_config")
+	if !strings.Contains(str(clusterType, "@type"), "dynamic_forward_proxy") {
+		t.Errorf("%s is not a dynamic forward proxy: %v", passthroughForwardProxyCluster, clusterType["@type"])
+	}
+	// Envoy rejects two differing configs of one DNS cache, so compare them whole.
+	if want, got := mustJSON(t, child(sni, "dns_cache_config")), mustJSON(t, child(clusterType, "dns_cache_config")); want != got || want == "null" {
+		t.Errorf("sni_dynamic_forward_proxy dns_cache_config %s differs from the cluster's %s", want, got)
+	}
+	if cluster["transport_socket"] != nil {
+		t.Errorf("%s has a transport socket; the payload is the actor's own TLS and must not be wrapped", passthroughForwardProxyCluster)
+	}
+	if cluster["typed_extension_protocol_options"] != nil {
+		t.Errorf("%s has HTTP protocol options; nothing on the passthrough chain is HTTP", passthroughForwardProxyCluster)
+	}
+
+	// Only the passthrough chain may dial the raw forward proxy, and it is the
+	// only raw one.
+	for _, lc := range allChains(tree) {
+		if str(lc.chain, "name") == "egress_passthrough" {
+			continue
+		}
+		if strings.Contains(mustJSON(t, lc.chain), passthroughForwardProxyCluster) {
+			t.Errorf("chain %q references %s; only egress_passthrough may dial by name without a request leg", str(lc.chain, "name"), passthroughForwardProxyCluster)
+		}
+	}
+	for _, c := range clusters(tree) {
+		if name := str(c, "name"); name != passthroughForwardProxyCluster && strings.Contains(mustJSON(t, c), "dynamic_forward_proxy") && !strings.Contains(mustJSON(t, c), `"typed_extension_protocol_options"`) {
+			t.Errorf("cluster %q is a dynamic forward proxy without HTTP protocol options; a raw by-name dial has no leg to authorize it", name)
+		}
+	}
+
+	// Nothing may dial the address the actor chose.
+	for _, c := range clusters(tree) {
+		if str(c, "type") == "ORIGINAL_DST" {
+			t.Errorf("cluster %q is ORIGINAL_DST; the gateway dials only names it resolved, never the actor's address", str(c, "name"))
+		}
+	}
+	if writers := filterStateWriters(tree, extproc.OriginalDstFilterStateKey); len(writers) != 0 {
+		t.Errorf("%s is written by %d filters; the gateway must not carry the address the actor dialed to the inner listener", extproc.OriginalDstFilterStateKey, len(writers))
+	}
+}
+
+// The dialed port reaches the passthrough chain as filter state the outer
+// chain copies from the CONNECT leg's answer, after ext_proc and from nothing
+// else. The forward proxy falls back to its configured port when the state is
+// absent, so a missing port would silently redirect the connection.
+func TestEgressManifestsConnectLegHandsTheDialedPortToTheInnerListener(t *testing.T) {
+	tree := bootstrapTree(t)
+	writers := filterStateWriters(tree, extproc.UpstreamDynamicPortFilterStateKey)
+	if len(writers) != 1 {
+		t.Fatalf("%s is set by %d filters, want exactly the CONNECT leg's copy of its answer", extproc.UpstreamDynamicPortFilterStateKey, len(writers))
+	}
+	entry := writers[0]
+	_, extProcAt, filters := extProcOf(outerChain(t, tree))
+	at := -1
+	for i, f := range filters {
+		if str(f, "name") != setFilterStateFilter {
+			continue
+		}
+		for _, v := range list(child(f, "typed_config"), "on_request_headers") {
+			if str(v, "object_key") == extproc.UpstreamDynamicPortFilterStateKey {
+				at = i
+			}
+		}
+	}
+	if at < 0 {
+		t.Fatalf("the writer of %s is not on the outer chain, where the answer is", extproc.UpstreamDynamicPortFilterStateKey)
+	}
+	if at < extProcAt {
+		t.Errorf("%s is set at http_filters[%d], before ext_proc at [%d]; the metadata it reads does not exist yet", extproc.UpstreamDynamicPortFilterStateKey, at, extProcAt)
+	}
+	if got := str(child(child(entry, "format_string"), "text_format_source"), "inline_string"); got != extproc.EgressDialedPortFormat {
+		t.Errorf("%s is set from %q, want %q", extproc.UpstreamDynamicPortFilterStateKey, got, extproc.EgressDialedPortFormat)
+	}
+	if got := str(entry, "factory_key"); got != "" {
+		t.Errorf("%s names factory %q; the factory of the same name is what parses the port", extproc.UpstreamDynamicPortFilterStateKey, got)
+	}
+	if str(entry, "shared_with_upstream") == "" {
+		t.Errorf("%s is not shared with upstream; the passthrough chain would dial its fallback port", extproc.UpstreamDynamicPortFilterStateKey)
+	}
 }

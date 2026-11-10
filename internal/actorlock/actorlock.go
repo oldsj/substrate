@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,6 +40,9 @@ func (m *CancelableMutex) Unlock() { m.ch <- struct{}{} }
 
 // LockContext returns false on cancellation without acquiring the mutex.
 func (m *CancelableMutex) LockContext(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	select {
 	case <-m.ch:
 		return true
@@ -48,7 +51,7 @@ func (m *CancelableMutex) LockContext(ctx context.Context) bool {
 	}
 }
 
-// Locks serializes lifecycle RPCs per actor.
+// Locks serializes lifecycle RPCs per actor. A zero value is ready to use.
 type Locks struct {
 	mu sync.Mutex
 	// References include holders and waiters; unused entries are removed.
@@ -67,7 +70,13 @@ func New() *Locks {
 
 // Lock returns false on cancellation without acquiring the actor's lock.
 func (l *Locks) Lock(ctx context.Context, actorUID string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	l.mu.Lock()
+	if l.held == nil {
+		l.held = map[string]*heldLock{}
+	}
 	entry, ok := l.held[actorUID]
 	if !ok {
 		entry = &heldLock{mutex: NewCancelableMutex()}
@@ -81,6 +90,17 @@ func (l *Locks) Lock(ctx context.Context, actorUID string) bool {
 	}
 	l.release(actorUID, false)
 	return false
+}
+
+// Busy reports whether a lifecycle RPC holds or is waiting for the named
+// actor's lock. It never blocks, so a reader that must not take the lock can
+// still tell whether the actor is mid-operation. The answer may be stale by the
+// time it returns: use it for advisory checks, not to decide lifecycle actions.
+func (l *Locks) Busy(actorUID string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.held[actorUID]
+	return ok
 }
 
 // Unlock releases the named actor's lock.

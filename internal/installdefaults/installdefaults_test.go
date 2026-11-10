@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,14 @@
 package installdefaults
 
 import "testing"
+
+// ate-api-server matches bootstrap owners on this exact string, which is the
+// username Kubernetes puts in a ServiceAccount token's subject.
+func TestClientPrincipal(t *testing.T) {
+	if got, want := ClientPrincipal("ate-system"), "system:serviceaccount:ate-system:ate-client"; got != want {
+		t.Errorf("ClientPrincipal(ate-system) = %q, want %q", got, want)
+	}
+}
 
 func TestAteletSPIFFEID(t *testing.T) {
 	tests := []struct {
@@ -47,7 +55,7 @@ func TestAteletSPIFFEID(t *testing.T) {
 }
 
 func TestRouterSPIFFEID(t *testing.T) {
-	// Matches the --atunnel-client-identity default the ateom binaries ship
+	// Matches the --atunnel-client-identity default the worker binaries ship
 	// with, which is what actor ingress authenticates the router against.
 	const want = "spiffe://cluster.local/ns/ate-system/sa/atenet-router"
 	if got := RouterSPIFFEID(SystemNamespace); got != want {
@@ -61,6 +69,62 @@ func TestEgressSPIFFEID(t *testing.T) {
 	const want = "spiffe://cluster.local/ns/ate-system/sa/atenet-egress"
 	if got := EgressSPIFFEID(SystemNamespace); got != want {
 		t.Errorf("EgressSPIFFEID(%q) = %q, want %q", SystemNamespace, got, want)
+	}
+}
+
+func TestControllerSPIFFEID(t *testing.T) {
+	const want = "spiffe://cluster.local/ns/ate-system/sa/ate-controller"
+	if got := ControllerSPIFFEID(SystemNamespace); got != want {
+		t.Errorf("ControllerSPIFFEID(%q) = %q, want %q", SystemNamespace, got, want)
+	}
+}
+
+func TestAPIServerSPIFFEID(t *testing.T) {
+	// Matches the --api-server-sidecar-spiffe-id default ate-api-server ships
+	// with, the identity its pod presents on the loopback.
+	const want = "spiffe://cluster.local/ns/ate-system/sa/ate-api-server"
+	if got := APIServerSPIFFEID(SystemNamespace); got != want {
+		t.Errorf("APIServerSPIFFEID(%q) = %q, want %q", SystemNamespace, got, want)
+	}
+}
+
+func TestAPIServiceHost(t *testing.T) {
+	for _, tt := range []struct{ namespace, want string }{
+		{"ate-system", "api.ate-system.svc"},
+		{"substrate-prod", "api.substrate-prod.svc"},
+	} {
+		if got := APIServiceHost(tt.namespace); got != tt.want {
+			t.Errorf("APIServiceHost(%q) = %q, want %q", tt.namespace, got, tt.want)
+		}
+	}
+}
+
+func TestActorJWTIssuer(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace string
+		want      string
+	}{
+		{
+			// Relying parties compare iss against this byte for byte, so
+			// changing it breaks verification for every default install.
+			name:      "default namespace",
+			namespace: SystemNamespace,
+			want:      "https://idp.ate-system.svc",
+		},
+		{
+			name:      "namespace the install was relocated to",
+			namespace: "team-a-substrate",
+			want:      "https://idp.team-a-substrate.svc",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ActorJWTIssuer(tt.namespace); got != tt.want {
+				t.Errorf("ActorJWTIssuer(%q) = %q, want %q", tt.namespace, got, tt.want)
+			}
+		})
 	}
 }
 

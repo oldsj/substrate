@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,12 +20,16 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/encoding/prototext"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
-	"github.com/agent-substrate/substrate/internal/localca"
-	"github.com/agent-substrate/substrate/internal/localjwtauthority"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/internal/apiconfig"
+	"go.ate.dev/substrate/internal/localca"
+	"go.ate.dev/substrate/internal/localjwtauthority"
+	"go.ate.dev/substrate/pkg/proto/ateconfigpb"
 )
 
 // Secret and ConfigMap names the control plane reads.
@@ -35,13 +39,15 @@ const (
 	SecretActorIDCACerts   = "actor-id-ca-certs"
 	SecretServiceDNSCA     = "service-dns-ca-pool"
 	SecretPodIdentityCA    = "pod-identity-ca-pool"
+	SecretPostgresCA       = "postgres-ca-pool"
 	SecretEgressMITMCAPool = "egress-mitm-ca-pool"
 	SecretAPIEnvVars       = "ate-api-server-secret-envvars"
 	SecretPostgresServerCA = "postgres-server-ca"
 	ConfigMapAPIEnvVars    = "ate-api-server-envvars"
 	ConfigMapAPIAuthn      = "ate-api-authentication"
-	// poolKeyID is the identifier given to the first CA and JWT key in a new
-	// pool, matching the --ca-id/--key-id the shell scripts passed.
+	ConfigMapAPIConfig     = "ate-api-config"
+	// poolKeyID is the identifier given to the first CA in a new pool,
+	// matching the --ca-id the shell scripts passed.
 	poolKeyID = "1"
 )
 
@@ -50,6 +56,7 @@ const (
 const caValidity = 365 * 24 * time.Hour
 
 // CreateJWTAuthorityPoolSecret generates the actor-identity JWT signing pool.
+// An existing pool is kept.
 // This is the make-jwt-pool call create_jwt_authority_pool_secret shelled out
 // to kubectl-ate for.
 func (e *Env) CreateJWTAuthorityPoolSecret(ctx context.Context) error {
@@ -57,10 +64,12 @@ func (e *Env) CreateJWTAuthorityPoolSecret(ctx context.Context) error {
 	return e.createJWTPool(ctx, e.Namespace(), SecretActorIDJWTPool)
 }
 
-// CreateActorIDCAPoolSecret generates the actor-identity CA pool.
+// CreateActorIDCAPoolSecret generates the actor-identity CA pool. External
+// relying parties trust this root, so it uses ECDSA P-256, which is more
+// broadly accepted than Ed25519.
 func (e *Env) CreateActorIDCAPoolSecret(ctx context.Context) error {
 	log.Step("create_actor_id_ca_pool_secret")
-	return e.createCAPool(ctx, e.Namespace(), SecretActorIDCAPool)
+	return e.createCAPool(ctx, e.Namespace(), SecretActorIDCAPool, localca.KeyTypeECDSAP256)
 }
 
 // CreateEgressMITMCAPoolSecret generates the egress MITM CA pool.
@@ -82,27 +91,27 @@ func (e *Env) CreateEgressMITMCAPoolSecret(ctx context.Context) error {
 	return e.createPoolSecret(ctx, e.Namespace(), SecretEgressMITMCAPool, corev1.SecretTypeTLS, data)
 }
 
-// EnsureEgressMITMCAPoolSecret creates the egress MITM CA pool secret if
-// sdsmint is enabled. Both dataplanes need it: the agentgateway-egress-mitm
-// overlay mounts the same Secret the envoy egress does.
+// EnsureEgressMITMCAPoolSecret creates the egress MITM CA pool secret. Both
+// dataplanes need it: the agentgateway-egress overlay mounts the same
+// Secret the envoy egress does.
 func (e *Env) EnsureEgressMITMCAPoolSecret(ctx context.Context) error {
-	if !e.Cfg.ExperimentalUseSDSMint {
-		return nil
-	}
 	return e.ensureSecret(ctx, e.Namespace(), SecretEgressMITMCAPool, e.CreateEgressMITMCAPoolSecret)
 }
 
-// CreatePodCertificateControllerCAs generates the two signer pools the
+// CreatePodCertificateControllerCAs generates the signer pools the
 // podcertificate controller issues from.
 func (e *Env) CreatePodCertificateControllerCAs(ctx context.Context) error {
 	log.Step("create_podcertificate_controller_cas")
 	if err := e.Kube.EnsureNamespace(ctx, NamespacePodCert); err != nil {
 		return err
 	}
-	if err := e.createCAPool(ctx, NamespacePodCert, SecretServiceDNSCA); err != nil {
+	if err := e.createCAPool(ctx, NamespacePodCert, SecretServiceDNSCA, localca.KeyTypeED25519); err != nil {
 		return err
 	}
-	return e.createCAPool(ctx, NamespacePodCert, SecretPodIdentityCA)
+	if err := e.createCAPool(ctx, NamespacePodCert, SecretPodIdentityCA, localca.KeyTypeED25519); err != nil {
+		return err
+	}
+	return e.createCAPool(ctx, NamespacePodCert, SecretPostgresCA, localca.KeyTypeED25519)
 }
 
 // CreateActorIDCACertsSecret derives a certificate-only trust bundle from the
@@ -122,15 +131,73 @@ func (e *Env) CreateActorIDCACertsSecret(ctx context.Context) error {
 	})
 }
 
+// defaultAPILogLevel is the ate-api-server log level a new install gets when
+// none is asked for.
+const defaultAPILogLevel = "info"
+
+// CreateAPIConfig writes the ate-api-server config file.
+func (e *Env) CreateAPIConfig(ctx context.Context) error {
+	log.Step("create_api_config")
+	if err := e.Kube.EnsureNamespace(ctx, e.Namespace()); err != nil {
+		return err
+	}
+
+	logLevel := e.Cfg.APILogLevel
+	if logLevel == "" {
+		logLevel = defaultAPILogLevel
+	}
+	apiConfig, err := buildAPIConfig(logLevel)
+	if err != nil {
+		return err
+	}
+	log.Infof("%s apiconfig.textproto:", ConfigMapAPIConfig)
+	for _, line := range strings.Split(strings.TrimRight(apiConfig, "\n"), "\n") {
+		log.Infof("  | %s", line)
+	}
+	return e.Kube.ApplyConfigMap(ctx, e.Namespace(), ConfigMapAPIConfig, map[string]string{
+		"apiconfig.textproto": apiConfig,
+	})
+}
+
+// UpdateAPIConfig is CreateAPIConfig for an install that is not being
+// redeployed: it also stamps the new digest on the running Deployment,
+// which rolls ate-api-server onto the new config.
+func (e *Env) UpdateAPIConfig(ctx context.Context) error {
+	if err := e.CreateAPIConfig(ctx); err != nil {
+		return err
+	}
+	return e.annotateAPIServerEnvHash(ctx)
+}
+
+// buildAPIConfig renders apiconfig.textproto.
+func buildAPIConfig(logLevel string) (string, error) {
+	b, err := prototext.MarshalOptions{Multiline: true}.Marshal(&ateconfigpb.APIConfig{
+		Logging: &ateconfigpb.APILogging{Level: logLevel},
+	})
+	if err != nil {
+		return "", fmt.Errorf("while marshaling the ate-api-server config: %w", err)
+	}
+	return string(b), nil
+}
+
 // CreateAPIAuthenticationConfig writes the default ate-api-server
 // authentication config, pointing it at the cluster's service account issuer.
 func (e *Env) CreateAPIAuthenticationConfig(ctx context.Context) error {
+	return e.applyAPIAuthenticationConfig(ctx, &apiconfig.AuthenticationConfig{
+		JWTProviders: []apiconfig.JWTProviderConfig{kubernetesJWTProvider(e.jwtIssuer(ctx))},
+	})
+}
+
+func (e *Env) applyAPIAuthenticationConfig(ctx context.Context, cfg *apiconfig.AuthenticationConfig) error {
 	log.Step("create_api_authentication_config")
 	if err := e.Kube.EnsureNamespace(ctx, e.Namespace()); err != nil {
 		return err
 	}
 
-	authnConfig := buildAuthenticationConfig(e.jwtIssuer(ctx))
+	authnConfig, err := marshalAuthenticationConfig(cfg)
+	if err != nil {
+		return err
+	}
 	// The issuer decides which tokens the apiserver accepts at all, and a
 	// wrong one fails as an opaque 401 much later, so show what was written.
 	log.Infof("%s authentication.yaml:", ConfigMapAPIAuthn)
@@ -140,6 +207,16 @@ func (e *Env) CreateAPIAuthenticationConfig(ctx context.Context) error {
 	return e.Kube.ApplyConfigMap(ctx, e.Namespace(), ConfigMapAPIAuthn, map[string]string{
 		"authentication.yaml": authnConfig,
 	})
+}
+
+// UpdateAPIAuthenticationConfig is CreateAPIAuthenticationConfig for an install
+// that is not being redeployed: it also stamps the new digest on the running
+// Deployment, which rolls ate-api-server onto the new config.
+func (e *Env) UpdateAPIAuthenticationConfig(ctx context.Context) error {
+	if err := e.CreateAPIAuthenticationConfig(ctx); err != nil {
+		return err
+	}
+	return e.annotateAPIServerEnvHash(ctx)
 }
 
 // jwtIssuer determines the service account token issuer to trust.
@@ -168,24 +245,54 @@ func (e *Env) jwtIssuer(ctx context.Context) string {
 // discoverable one.
 const inClusterIssuer = "https://kubernetes.default.svc"
 
-// buildAuthenticationConfig renders authentication.yaml.
+// kubernetesJWTProvider builds the default kubernetes JWT provider entry.
 //
 // An in-cluster issuer is not reachable over public discovery, so the apiserver
 // is pointed at its own projected service account CA and token to complete the
 // OIDC discovery handshake. A GKE or otherwise external issuer needs neither.
-func buildAuthenticationConfig(issuer string) string {
-	config := fmt.Sprintf(
-		"actorIdentityJWTProvider: kubernetes\njwtProviders:\n- name: kubernetes\n  issuer: %s\n  audiences: [api.ate-system.svc]\n",
-		issuer)
+func kubernetesJWTProvider(issuer string) apiconfig.JWTProviderConfig {
+	p := apiconfig.JWTProviderConfig{
+		Name:      "kubernetes",
+		Issuer:    issuer,
+		Audiences: []string{"api.ate-system.svc"},
+	}
 	switch issuer {
 	case inClusterIssuer, inClusterIssuer + ".cluster.local":
-		config += "  certificateAuthorityFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt\n" +
-			"  discoveryTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token\n"
+		p.CertificateAuthorityFile = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+		p.DiscoveryTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	}
-	// The shell script built this inside $(...), which strips trailing
-	// newlines. Matching that keeps the ConfigMap byte-identical, so switching
-	// between the two installers does not rewrite it.
-	return strings.TrimRight(config, "\n")
+	return p
+}
+
+// setKubernetesJWTProvider replaces the kubernetes entry in cfg, or prepends
+// one if none exists, preserving any additional JWT providers.
+func setKubernetesJWTProvider(cfg *apiconfig.AuthenticationConfig, issuer string) {
+	k8sProvider := kubernetesJWTProvider(issuer)
+	for i := range cfg.JWTProviders {
+		if cfg.JWTProviders[i].Name == k8sProvider.Name {
+			cfg.JWTProviders[i] = k8sProvider
+			return
+		}
+	}
+	cfg.JWTProviders = append([]apiconfig.JWTProviderConfig{k8sProvider}, cfg.JWTProviders...)
+}
+
+// buildAuthenticationConfig renders the default authentication.yaml for issuer.
+func buildAuthenticationConfig(issuer string) (string, error) {
+	return marshalAuthenticationConfig(&apiconfig.AuthenticationConfig{
+		JWTProviders: []apiconfig.JWTProviderConfig{kubernetesJWTProvider(issuer)},
+	})
+}
+
+func marshalAuthenticationConfig(cfg *apiconfig.AuthenticationConfig) (string, error) {
+	if err := apiconfig.ValidateAuthenticationConfig(cfg); err != nil {
+		return "", fmt.Errorf("while validating the ate-api-server authentication config: %w", err)
+	}
+	b, err := yaml.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("while marshaling the ate-api-server authentication config: %w", err)
+	}
+	return strings.TrimRight(string(b), "\n"), nil
 }
 
 // createCAPool generates a CA pool and stores it in a Secret.
@@ -193,7 +300,7 @@ func buildAuthenticationConfig(issuer string) string {
 // An existing pool is left alone. Regenerating it would rotate the root out
 // from under every certificate already issued from it, and the callers in the
 // shell script all guarded these calls with an existence check for that reason.
-func (e *Env) createCAPool(ctx context.Context, namespace, name string) error {
+func (e *Env) createCAPool(ctx context.Context, namespace, name string, keyType localca.KeyType) error {
 	exists, err := e.Kube.SecretExists(ctx, namespace, name)
 	if err != nil {
 		return err
@@ -203,7 +310,7 @@ func (e *Env) createCAPool(ctx context.Context, namespace, name string) error {
 		return nil
 	}
 
-	data, err := newCAPoolSecretData(poolKeyID, localca.KeyTypeED25519)
+	data, err := newCAPoolSecretData(poolKeyID, keyType)
 	if err != nil {
 		return fmt.Errorf("while generating the CA pool for %s/%s: %w", namespace, name, err)
 	}
@@ -219,7 +326,7 @@ func (e *Env) createCAPool(ctx context.Context, namespace, name string) error {
 //
 // The certificate and key are not redundant with the pool. Consumers that speak
 // TLS rather than the pool format mount them directly — the
-// agentgateway-egress-mitm overlay mounts tls.crt and tls.key from
+// agentgateway-egress overlay mounts tls.crt and tls.key from
 // egress-mitm-ca-pool non-optionally, so a pool Secret holding only "pool"
 // leaves atenet-egress stuck in ContainerCreating.
 func newCAPoolSecretData(id string, keyType localca.KeyType) (map[string][]byte, error) {
@@ -253,27 +360,30 @@ func newCAPoolSecretData(id string, keyType localca.KeyType) (map[string][]byte,
 // with the CA pools, an existing pool is preserved: rotating the signing key
 // would invalidate every token already minted from it.
 func (e *Env) createJWTPool(ctx context.Context, namespace, name string) error {
-	exists, err := e.Kube.SecretExists(ctx, namespace, name)
+	existing, err := e.Kube.GetSecret(ctx, namespace, name)
 	if err != nil {
 		return err
 	}
-	if exists {
+	if existing != nil {
 		log.Infof("  JWT authority pool %s/%s already exists; keeping it", namespace, name)
 		return nil
 	}
 
-	authority, err := localjwtauthority.GenerateECDSAP256Authority(poolKeyID)
+	data, err := newJWTPoolSecretData(e.Cfg.ActorJWTAlgorithm)
 	if err != nil {
-		return fmt.Errorf("while generating the JWT authority for %s/%s: %w", namespace, name, err)
+		return fmt.Errorf("while building the JWT pool for %s/%s: %w", namespace, name, err)
 	}
-	poolBytes, err := localjwtauthority.Marshal(&localjwtauthority.ConcretePool{
-		Authorities:      []*localjwtauthority.Authority{authority},
-		ActiveForSigning: poolKeyID,
-	})
+	return e.createPoolSecret(ctx, namespace, name, corev1.SecretTypeOpaque, data)
+}
+
+// newJWTPoolSecretData generates a pool with one active authority for
+// algorithm, keyed by its thumbprint.
+func newJWTPoolSecretData(algorithm string) (map[string][]byte, error) {
+	poolBytes, _, err := localjwtauthority.GeneratePool(algorithm, "")
 	if err != nil {
-		return fmt.Errorf("while marshaling the JWT pool for %s/%s: %w", namespace, name, err)
+		return nil, fmt.Errorf("while generating the JWT pool: %w", err)
 	}
-	return e.createPoolSecret(ctx, namespace, name, corev1.SecretTypeOpaque, map[string][]byte{"pool": poolBytes})
+	return map[string][]byte{"pool": poolBytes}, nil
 }
 
 // createPoolSecret writes pool state.

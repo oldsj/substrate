@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 package controlapi
 
 import (
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 )
 
-func toDeletePreconditions(opts *ateapipb.DeleteOptions) store.DeletePreconditions {
+func toDeletePreconditions(opts *ateapi.DeleteOptions) store.DeletePreconditions {
 	return store.DeletePreconditions{UID: opts.GetUid(), Version: opts.GetVersion()}
 }

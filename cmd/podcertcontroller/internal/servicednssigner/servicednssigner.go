@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,9 +22,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/signercontroller"
-	"github.com/agent-substrate/substrate/internal/localca"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/podcertificate"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/signercontroller"
+	"go.ate.dev/substrate/internal/localca"
+	certsv1 "k8s.io/api/certificates/v1"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,14 +38,16 @@ const Name = "servicedns.podcert.ate.dev/identity"
 const CTBPrefix = "servicedns.podcert.ate.dev:identity:"
 
 type Impl struct {
-	kc     kubernetes.Interface
-	caPool localca.Pool
+	kc        kubernetes.Interface
+	pcrClient *podcertificate.Client
+	caPool    localca.Pool
 }
 
-func NewImpl(kc kubernetes.Interface, caPool localca.Pool) *Impl {
+func NewImpl(kc kubernetes.Interface, caPool localca.Pool, pcrClient *podcertificate.Client) *Impl {
 	return &Impl{
-		kc:     kc,
-		caPool: caPool,
+		kc:        kc,
+		pcrClient: pcrClient,
+		caPool:    caPool,
 	}
 }
 
@@ -54,7 +57,7 @@ func (h *Impl) SignerName() string {
 	return Name
 }
 
-func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
+func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1.ClusterTrustBundle, error) {
 	name := CTBPrefix + "primary-bundle"
 
 	trustAnchors, err := h.caPool.TrustAnchors()
@@ -71,20 +74,20 @@ func (h *Impl) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle,
 		_, _ = wantTrustBundle.Write(block)
 	}
 
-	wantCTB := &certsv1beta1.ClusterTrustBundle{
+	wantCTB := &certsv1.ClusterTrustBundle{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 			Labels: map[string]string{
 				"podcert.ate.dev/canarying": "live",
 			},
 		},
-		Spec: certsv1beta1.ClusterTrustBundleSpec{
+		Spec: certsv1.ClusterTrustBundleSpec{
 			SignerName:  Name,
 			TrustBundle: wantTrustBundle.String(),
 		},
 	}
 
-	return []*certsv1beta1.ClusterTrustBundle{
+	return []*certsv1.ClusterTrustBundle{
 		wantCTB,
 	}, nil
 }
@@ -209,7 +212,7 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 	pcr.Status.BeginRefreshAt = ptr.To(metav1.NewTime(beginRefreshAt))
 	pcr.Status.NotAfter = ptr.To(metav1.NewTime(notAfter))
 
-	_, err = h.kc.CertificatesV1beta1().PodCertificateRequests(pcr.ObjectMeta.Namespace).UpdateStatus(ctx, pcr, metav1.UpdateOptions{})
+	err = h.pcrClient.UpdateStatus(ctx, pcr)
 	if err != nil {
 		return fmt.Errorf("while updating PodCertificateRequest: %w", err)
 	}

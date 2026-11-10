@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,8 +26,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/internal/egresspolicy"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/egresspolicy"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 var testActorRef = resources.ActorRef{Atespace: testEgressAtespace, Name: testEgressActor}
@@ -180,14 +180,14 @@ func TestPolicyCacheFetchOutlivesCanceledCaller(t *testing.T) {
 // An entry is stale the instant its TTL has elapsed, not a tick later, and a
 // refetch after expiry returns the policy as it is now, not as it was.
 func TestPolicyCacheExpiryBoundaryAndUpdateVisibility(t *testing.T) {
-	client := &egressMockClient{policy: hostnamesPolicy("old.example")}
+	client := &egressMockClient{policy: httpPolicy("old.example")}
 	c, now := newTestCache(client, 10*time.Second)
 
 	before, err := c.get(context.Background(), testActorRef)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	client.policy = hostnamesPolicy("new.example")
+	client.policy = httpPolicy("new.example")
 
 	*now = now.Add(10*time.Second - time.Nanosecond)
 	if p, _ := c.get(context.Background(), testActorRef); p != before {
@@ -198,7 +198,7 @@ func TestPolicyCacheExpiryBoundaryAndUpdateVisibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get after expiry: %v", err)
 	}
-	if after == before || !after.Evaluate(egresspolicy.Destination{Hostname: "new.example"}).Allowed {
+	if after == before || !after.EvaluateRequest(egresspolicy.Destination{Hostname: "new.example"}, false).Allowed {
 		t.Error("the refetch did not pick up the updated policy")
 	}
 }

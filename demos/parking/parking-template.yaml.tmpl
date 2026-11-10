@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ActorTemplate (protojson-shaped ateapipb.ActorTemplate) for the parking
+# ActorTemplate (protojson-shaped ateapi.ActorTemplate) for the parking
 # demo. Applied with `kubectl ate create actor-template -f -` after
 # `ko resolve` replaces the ko:// image reference; the ate-demo-parking
 # atespace must exist.
@@ -24,12 +24,17 @@ workerSelector:
     workload: parking
 containers:
 - name: counter
-  image: ko://github.com/agent-substrate/substrate/demos/counter
+  image: ko://go.ate.dev/substrate/demos/counter
   command: ["/ko-app/counter"]
+  wakeupProbe:
+    httpGet:
+      path: /readyz
+      port: 80
+# Sandbox size: an actor occupies its whole worker, so size it at (or below)
+# the pool's per-worker capacity (see parking.yaml.tmpl and internal/sizing).
+resources:
+  limits:
+    cpuMillicores: 1000
+    memoryBytes: 536870912 # 512Mi
 snapshotConfig:
-  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
-  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
-  storageLocation: gs://${BUCKET_NAME}/ate-demo-parking/
-sandboxConfig:
-  sandboxClass: SANDBOX_CLASS_GVISOR
-  configName: gvisor-default
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY

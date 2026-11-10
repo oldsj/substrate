@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,7 +47,7 @@ type envoyDrainer struct {
 func newEnvoyDrainer(adminAddr string) *envoyDrainer {
 	return &envoyDrainer{
 		adminAddr:    adminAddr,
-		client:       &http.Client{Timeout: 2 * time.Second},
+		client:       &http.Client{Transport: newLoopbackTransport(), Timeout: 2 * time.Second},
 		pollInterval: envoyDrainPollInterval,
 	}
 }

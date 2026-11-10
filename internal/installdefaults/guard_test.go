@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,9 +52,8 @@ var allowedLiterals = map[string][]string{
 	"internal/e2e/fixtures/testserver/egressprobe.go": {"atenet-egress.ate-system.svc:443"},
 	// Env-var defaults, overridden by ATE_* / E2E_* variables.
 	"internal/ateclient/builder.go": {"api.ate-system.svc"},
-	// Inert: the actor JWT issuer is an upstream TODO nothing validates, and
-	// an x509 template's Issuer field is overwritten by the signer.
-	"cmd/ateapi/internal/controlapi/actor.go": {"https://api.ate-system.svc", "api.ate-system.svc.cluster.local"},
+	// Inert: an x509 template's Issuer field is overwritten by the signer.
+	"cmd/ateapi/internal/controlapi/actor.go": {"api.ate-system.svc.cluster.local"},
 }
 
 // suspect reports whether a string literal encodes canonical install layout.

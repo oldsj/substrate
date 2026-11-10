@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	gluttonpb "github.com/agent-substrate/substrate/internal/proto/glutton"
+	gluttonpb "go.ate.dev/substrate/internal/proto/glutton"
 )
 
 func TestWriteDiskReadDiskRoundTrip(t *testing.T) {

@@ -5,7 +5,7 @@ instrument to pick, how to name it, which labels it may carry, how to write the
 Go, how to test it, and how to register it. It is the metrics counterpart of
 [Tracing Best Practices](tracing.md).
 
-Read [Actor Observability](../../observability.md#2-metrics) first if you have
+Read [Actor Observability](../../guides/observability.md#2-metrics) first if you have
 not: it explains what already exists and how the registry is used. This
 document is about adding to it.
 
@@ -41,7 +41,7 @@ Every metric PR has these parts. Reviewers check for each one.
    `docs/metrics/registry/metrics.yaml`, and `hack/verify/metrics.sh` passes.
 5. If the metric has a rule the registry cannot hold, or a blind spot it closes,
    `docs/metrics/substrate.yaml` is updated.
-6. The metrics table in `docs/observability.md` has a row for it.
+6. The metrics table in `docs/guides/observability.md` has a row for it.
 
 ## Choosing the instrument
 
@@ -67,7 +67,7 @@ Rules of thumb:
   it ends, you subtract one. `ate.workerpool.workers` is one because ateapi
   assigns and releases every worker, so it is the one keeping that tally. A
   gauge is a dial you read: memory working set is whatever the sandbox reports
-  when atelet polls it (a cgroup on gVisor, the guest agent on micro-VM),
+  when atelet polls it (a cgroup on gVisor, the guest agent on microVM),
   written down per template. Ask "did I get this number by
   adding and subtracting, or by looking?" and the answer is the instrument.
   How a dashboard later aggregates the number does not enter into it. The
@@ -159,7 +159,7 @@ ones every new metric meets:
 * **Normalize at the producer.** When a value arrives from the wire or from a
   file nothing validated, map it onto the bounded set before recording:
   `ateattr.NormalizeSandboxClass`, `ateattr.NormalizeOperationName`,
-  `ateattr.SnapshotScopeValue`. An unrecognized value reports `unknown`, never
+  `ateattr.SnapshotFidelityValue`. An unrecognized value reports `unknown`, never
   the raw string.
 * **Omit a label you do not know rather than emit it empty.** A resume that
   failed before a worker was picked has no pool; the pool keys are absent, not
@@ -277,8 +277,10 @@ component name as the scope (`"atelet"`, `"ateapi"`, `"atecontroller"`):
 
 The meter provider itself is set up once per binary by
 `serverboot.InitMetrics` (Prometheus reader plus OTLP push),
-`serverboot.InitMetricsPushOnly` (OTLP push only; atecontroller), or
-`serverboot.InitMetricsPushOnlyVia` (OTLP push over the atelet relay; ateom).
+`serverboot.InitMetricsBridged` (OTLP push with a foreign Prometheus registry
+bridged onto it, or that registry alone under `OTEL_METRICS_EXPORTER=prometheus`,
+and whether to serve it; atecontroller), or `serverboot.InitMetricsPushOnlyVia`
+(OTLP push only, over the atelet relay when given one; ateworker).
 A new component calls one of these and defers `ShutdownProvider`; a new package
 inside an existing component adds nothing there.
 
@@ -460,19 +462,12 @@ entry), when it has a rule Weaver cannot express (add it under
 `cardinality_rules` with what could enforce it), or when it deliberately
 breaks a convention (add a `lint_exceptions` entry with the reason).
 
-### `docs/observability.md`
+### `docs/guides/observability.md`
 
 Add a row to the metrics table under "2. Metrics": name, emitting component,
 instrument kind, and one sentence on what it measures with the label list. If
 the label semantics need more than a sentence (as the snapshot labels did), add
 a short paragraph below the table rather than growing the row.
-
-### Dashboards
-
-Cloud Monitoring dashboards live in `tools/setup-gcp/dashboards/`. A new metric
-does not need a new dashboard in the same PR, but a metric an operator will
-alert on should get a panel in a follow-up, and the PR description should say
-which question the panel answers.
 
 ## Worked example: a node-local snapshot cache
 
@@ -513,5 +508,5 @@ Steps, in order:
    instruments ship with the cache, so it starts with no blind spot; the
    `image cache cost and eviction` entry there is the image cache's gap, not
    this one's.
-7. `docs/observability.md`: four rows in the table, one paragraph on the
+7. `docs/guides/observability.md`: four rows in the table, one paragraph on the
    outcome semantics.

@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,16 +15,12 @@
 package demos
 
 import (
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/render"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/steps"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/render"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
 )
 
-// bucketNamePlaceholder is substituted into every demo template with the
-// snapshot bucket for this environment.
-const bucketNamePlaceholder = "BUCKET_NAME"
-
 // ExternalVolumePlaceholders are the optional external-volume hooks in the
-// counter and autoscaled-workerpool templates. Every path except
+// counter templates. Every path except
 // `deploy demo counter --with-external-volume` drops them, which removes the
 // lines entirely.
 var ExternalVolumePlaceholders = []string{
@@ -33,19 +29,7 @@ var ExternalVolumePlaceholders = []string{
 	"EXTERNAL_VOLUMES",
 }
 
-// Render expands a demo template with the configured bucket name and the
-// build version (pool templates pin worker pods to version-labeled nodes).
-func Render(e *steps.Env, relPath string, extraValues map[string]string, drop []string) ([]byte, error) {
-	version, _, err := e.SubstrateVersion()
-	if err != nil {
-		return nil, err
-	}
-	values := map[string]string{
-		bucketNamePlaceholder: e.Cfg.BucketName,
-		"SUBSTRATE_VERSION":   version,
-	}
-	for k, v := range extraValues {
-		values[k] = v
-	}
+// Render expands a demo template with values.
+func Render(e *steps.Env, relPath string, values map[string]string, drop []string) ([]byte, error) {
 	return render.Template(e.Cfg.Path(relPath), values, drop)
 }

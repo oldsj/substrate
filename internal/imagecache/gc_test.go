@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -564,7 +564,7 @@ func TestConcurrentEnsureImageAndEvict(t *testing.T) {
 		}
 		// The returned image must reference live, complete layer dirs. Its
 		// record must be fresh (either the hit's touch or the re-pull wrote
-		// it), which is what protects it until an ateom would mount it.
+		// it), which is what protects it until a worker would mount it.
 		for _, dir := range img.LayerDirs {
 			if _, err := os.Stat(filepath.Join(dir, layerFSDirName, "f")); err != nil {
 				t.Fatalf("iteration %d: returned layer dir unusable: %v", i, err)

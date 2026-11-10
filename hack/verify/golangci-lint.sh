@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ cd "${ROOT}"
 # executable on the developer's machine, then invoke it with GOOS=linux so
 # the linter analyzes the code the same way it would on the Linux CI
 # runners. Without the GOOS=linux override, platform-gated packages
-# (notably the netlink bindings used by ateom-gvisor) fail to typecheck on
+# (notably the netlink bindings used by ateworker-gvisor) fail to typecheck on
 # macOS and golangci-lint's typecheck fail-stop suppresses all other
 # findings in the affected files.
 BIN="$("${ROOT}"/hack/run-tool.sh --print-bin-path golangci-lint)"

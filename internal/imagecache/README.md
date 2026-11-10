@@ -24,9 +24,10 @@ What it buys, concretely:
   single-digit milliseconds on warm nodes.
 - Layers shared between images are **downloaded and unpacked once per
   node**, not once per image; actors sharing layers also share page cache.
-- The cache is **on disk and survives atelet restarts and node reboots**
-  (the old in-memory cache was lost on every restart, and its unbounded heap
-  retention could OOM atelet — #437).
+- The cache is **on disk and survives atelet restarts** (the old in-memory
+  cache was lost on every restart, and its unbounded heap retention could OOM
+  atelet — #437). Its writes aren't synced, so atelet empties it at startup
+  after a node reboot.
 - **Tag refs are cacheable**: a tag costs one `HEAD` request to resolve to a
   manifest digest (the only safe cache key for mutable tags); digest refs
   hit the cache with zero network I/O.
@@ -36,32 +37,36 @@ What it buys, concretely:
 ## The privilege split
 
 The design is shaped by an existing substrate boundary: **atelet runs as
-plain root with every Linux capability dropped** ("atelet does no mounts" —
-see `manifests/ate-install/atelet.yaml`), while the **ateom worker pods are
-privileged** and own all mounts on the node. The module is split accordingly:
+root with every Linux capability dropped but a few for files other users
+own** ("atelet does no mounts" — see
+[`manifests/ate-install/atelet.yaml`](../../manifests/ate-install/atelet.yaml),
+which gives the reason for each), while the **worker pods** keep
+`CAP_SYS_ADMIN` and set up the rootfs mounts (see
+[Worker security](../../docs/reference/api-guide.md#worker-security)). The
+module is split accordingly:
 
 | Half | Runs in | Files | Needs |
 |---|---|---|---|
-| Store: pull, parse, unpack, record | atelet | `imagecache.go`, `unpack.go`, `spec.go` (portable) | nothing but file I/O |
-| Consumer: finalize, mount, unmount | ateom-gvisor / ateom-microvm | `bundle_linux.go` (`//go:build linux`) | `CAP_MKNOD`, `CAP_SYS_ADMIN`, `CAP_CHOWN` |
+| Store: pull, parse, unpack, record | atelet | `imagecache.go`, `unpack.go`, `spec.go` (portable) | file I/O; `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID` |
+| Consumer: finalize, mount, unmount | ateworker-gvisor / ateworker-microvm | `bundle_linux.go` (`//go:build linux`) | `CAP_SYS_ADMIN` (0:0 whiteouts need no `CAP_MKNOD` since Linux 5.8) |
 
 The two halves communicate through the filesystem only: the shared cache
-directory (on the `/var/lib/ateom-gvisor` hostPath, so the same absolute
+directory (on the `/var/lib/ate` hostPath, so the same absolute
 paths resolve in every pod) and a small per-bundle spec file.
 
 Because the consumer mounts the overlay **in its own mount namespace** —
 exactly where the workload resolves it (runsc's gofer for gVisor, virtiofsd
-for the micro-VM) — no Kubernetes mount-propagation configuration is needed
+for the microVM) — no Kubernetes mount-propagation configuration is needed
 anywhere.
 
 ## On-disk layout
 
 ```
-<cache-root>/                        default: /var/lib/ateom-gvisor/image-cache
-  version                            layout version marker ("2")
+<cache-root>/                        default: /var/lib/ate/image-cache
+  version                            layout version marker ("3")
   layers/sha256/<diffid-hex>/
       fs/                            the unpacked layer tree (an overlay lowerdir)
-      whiteouts.json                 whiteout, implicit-dir, and owner metadata
+      whiteouts.json                 whiteout state recorded at unpack time
       finalized                      marker written by FinalizeLayer (consumer side)
       size                           byte count recorded at unpack (lazily
                                      backfilled for older layers), so sizing
@@ -91,57 +96,70 @@ layer diffIDs in order — layers shared by N images exist once.
    present, return with no network I/O. Missing layers (only) are re-pulled.
 3. **Pull** by resolved digest: layers download in parallel (bounded at 4),
    each streamed download → decompress → untar directly into the pool.
-   Concurrent pulls of the same image or layer are collapsed with
-   singleflight, so simultaneous actor starts never duplicate work — and
-   each completed layer lands individually, so an interrupted pull makes
-   incremental progress across retries.
+   Concurrent pulls of the same image share one singleflight, and so do
+   concurrent unpacks of the same layer blob. A layer's flight is keyed by
+   its blob digest and its diffID, so one image's bad blob cannot fail
+   another image's pull of the same diffID. Each completed layer lands on
+   its own, so an interrupted pull makes progress across retries.
 4. **Unpack** (`unpackLayer`) is the repo's hardened untar: `os.Root`
    confinement (path traversal and symlink/hardlink escapes are refused),
    "later entry wins" within a layer, read-only-dir handling that works
    without `CAP_DAC_OVERRIDE`, and creation of parent directories that the
-   layer tar omits (they may exist only in lower layers). Whiteout entries
-   (`.wh.*`) are **not** written into the tree — overlayfs whiteouts are
-   char devices atelet cannot create — they are recorded in
-   `whiteouts.json` for the consumer to materialize. Non-root uid/gid values
-   are recorded there too; atelet cannot apply them without `CAP_CHOWN`, and
-   applying them to shared cached layers would make capability-free GC unable
-   to remove image-owned directories safely.
-5. **Record**: the image config + diffID list is written under the
+   layer tar omits (they may exist only in lower layers). Every entry keeps
+   the numeric owner and the exact mode its tar header records, setuid,
+   setgid and sticky bits included, as containerd and moby apply them
+   (see `unpackLayer` for how a failed chown or chmod is handled). A root
+   atelet inside a user namespace (rootless or userns-remapped nodes) can
+   only give files to uids and gids the namespace maps, so a layer with an
+   owner outside that range fails to unpack, as it does under rootless
+   Docker. Character and block device nodes are skipped (atelet runs
+   without `CAP_MKNOD` and the runtime mounts `/dev`). Whiteout entries
+   (`.wh.*`) are **not** written into the tree: opaque directories need
+   `trusted.*` xattrs (`CAP_SYS_ADMIN`), which atelet lacks, so the
+   whiteout state is recorded in `whiteouts.json` for the consumer to
+   materialize.
+5. **Verify** before the layer enters the pool. Images share layers by
+   diffID, but each image's author chooses the diffIDs in its config. So
+   the uncompressed stream is hashed as it unpacks and must match the
+   claimed diffID. The stream is also read to EOF, because
+   go-containerregistry checks the blob against the manifest digest only
+   at EOF. On a mismatch the `.tmp-*` tree is discarded and the pull fails.
+
+   A layer already in the pool is reused without re-hashing, because it
+   was checked when it was written. The reusing image's own blob is never
+   downloaded, so it is never checked. atelet refuses a layout version 1
+   pool, whose layers may not have been checked, and a version 2 pool,
+   whose layers are root-owned without setuid, setgid or sticky bits.
+6. **Record**: the image config + diffID list is written under the
    requested digest (and the per-platform child digest for multi-arch refs).
 
 `prepareOCIDirectory` in atelet then writes `rootfs-overlay.json`
-(`OverlaySpec`) into the bundle next to `config.json`, listing the layer
+(`OverlaySpec`) into the bundle, listing the layer
 directories bottom-first plus any `ExtraDirs` (in-rootfs bind-mount targets,
 e.g. the actor identity mount at `/run/ate`), and creates the empty
 bundle-local `rootfs/`, `upper/`, and `work/` directories.
 
-## Compose path (ateom: `SetupBundleRootfs`)
+## Compose path (ateworker: `SetupBundleRootfs`)
 
 Called immediately before `runsc create`/`runsc restore` (gVisor) and before
-staging the virtio-fs lower (micro-VM):
+staging the virtio-fs lower (microVM):
 
 1. **`FinalizeLayer`** for each referenced layer — materializes the recorded
    whiteouts as 0:0 char devices (`mknod`) and opaque dirs as
-   `trusted.overlay.opaque=y` xattrs. It validates ownership paths but leaves
-   ownership in metadata so cached layers remain root-owned and removable by
-   atelet GC. Finalization is once per layer node-wide, idempotent and safe
-   under concurrent ateom pods (`EEXIST` tolerated, marker written last).
-   Paths from `whiteouts.json` are re-validated, so a crafted file cannot
-   escape the layer tree.
+   `trusted.overlay.opaque=y` xattrs. Once per layer node-wide; idempotent
+   and safe under concurrent worker pods (`EEXIST` tolerated, marker written
+   last). Paths from `whiteouts.json` are re-validated, so a crafted file
+   cannot escape the layer tree.
 2. **Mount** an overlay at `<bundle>/rootfs`: `lowerdir` is the layer chain
    reversed into overlayfs's top-first order (duplicate layers — images can
    legitimately list the same diffID twice — are collapsed to the topmost
    occurrence, which overlayfs otherwise rejects with `ELOOP`), `upperdir` /
    `workdir` are the bundle-local dirs, holding this actor's private writes.
-   The `upper/` root receives the top layer's `fs/` root mode and owner
-   metadata so the merged `/` matches the image; an empty image uses
-   `0755 root:root`.
-   `work/` stays `0700 root:root`.
    The mount uses the new mount API (`fsopen` + one `fsconfig` `lowerdir+`
    append per layer) rather than `mount(2)`, whose single-page option-string
    cap the digest-derived layer paths would hit at ~34 layers. **Minimum
-   supported kernel: Linux 6.5** (`lowerdir+`); every current GKE channel
-   ships ≥ 6.6 (Stable: COS 121 LTS).
+   supported kernel: Linux 6.7, or 6.6.23** (`lowerdir+`, backported to
+   6.6.y).
 3. **ExtraDirs** are created through the mount (landing in the upper), again
    under `os.Root` confinement.
 4. **Implicit-parent metadata repair.** A layer tar routinely omits entries
@@ -157,13 +175,6 @@ staging the virtio-fs lower (micro-VM):
    is never modified. Residual gaps: directory mtimes and xattrs are not
    repaired, and a dir implicit in *every* layer of the chain keeps the
    fabricated attrs.
-5. **Non-root ownership fixups.** For visible entries whose uid/gid differs
-   from `0:0`, the consumer applies `lchown` through the mounted bundle rootfs
-   and restores mode bits that chown may clear. Overlayfs puts the metadata
-   changes in the bundle's private upper, leaving shared cache layers
-   root-owned. Chowning a regular file copies its full file data into that
-   bundle's upper, adding per-bundle disk use and copy-up I/O for large owned
-   files. Root-owned entries are skipped and do not copy up.
 
 A bundle without a spec file is left untouched (compatibility with bundles
 prepared by a pre-imagecache atelet). A zero-layer spec composes an empty
@@ -172,24 +183,14 @@ rootfs with ExtraDirs and no mount.
 Actor semantics are unchanged from the untar era: the upper is wiped by
 atelet's `resetActorDirs` between runs, so every run still starts from a
 bit-exact, pristine image rootfs — it just costs a mount instead of an
-extraction. The micro-VM path is nearly untouched: it bind-mounts the (now
+extraction. The microVM path is nearly untouched: it bind-mounts the (now
 overlay-composed) bundle rootfs into virtiofsd's shared dir and the guest
 keeps building its own tmpfs upper, as before.
 
 **Teardown**: `UnmountAllUnder(bundleDir)` lazily detaches every mount below
 an actor's bundle directory (via `/proc/self/mountinfo`) before atelet wipes
-it — called from the checkpoint cleanup path in ateom-gvisor and
-`teardownActor` in ateom-microvm. After unmount, it resets owners throughout
-`upper/` (including copied-up files and symlinks), makes its directories
-`0700`, then restores `rootfs/`, `upper/`, and `work/` to `0700 root:root`.
-This lets capability-free atelet wipe them even when image entries or the
-image root belonged to non-root uids.
-
-The layout marker is version 2 because older cached layers have no owner
-metadata. An atelet using the new layout rejects a version 1 cache and requires
-the cache to be cleared and repopulated before actors can start. `FinalizeLayer`
-also checks each layer's metadata version before honoring its finalized marker,
-so missing or legacy metadata fails closed even if the cache marker is absent.
+it — called from the checkpoint cleanup path in ateworker-gvisor and
+`teardownActor` in ateworker-microvm.
 
 ## Garbage collection
 
@@ -222,9 +223,9 @@ percentage as `df` reports it.
 
 1. **Root set** (`Store.InUse`): scan every bundle's
    `rootfs-overlay.json` under the actors dir (`WithActorsDir`).
-   Overlay mounts live in the ateom pods' mount namespaces, so atelet
+   Overlay mounts live in the worker pods' mount namespaces, so atelet
    cannot see them in its own `/proc/mounts`; the bundle specs are
-   written by atelet itself before any ateom is asked to mount and
+   written by atelet itself before any ateworker is asked to mount and
    removed only after unmount, so they are the authoritative "actively
    mounted" set. A spec roots its image digest, each layer dir it
    names, and its *exact* layer set — the last also roots the
@@ -238,9 +239,10 @@ percentage as `df` reports it.
    (after a freshness re-check under the same lock the cache-hit path
    holds), then retire each layer the removal left unreferenced. If any
    layer must be kept — still referenced by another record, rooted by a
-   spec, younger than min-age, or its retirement failed — the record is
-   restored byte-exact and the image simply is not evicted this pass: a
-   layer is never left on disk without a record explaining it.
+   spec, pinned by an in-flight pull, younger than min-age, or its
+   retirement failed — the record is restored byte-exact and the image
+   simply is not evicted this pass: a layer is never left on disk without
+   a record explaining it.
 
 The pass reaches layers **only through records**: a layer is deleted
 exactly when its last referencing record goes, never by an independent
@@ -253,14 +255,16 @@ refcounts and roots computed from partial data would retire layers that
 unread records still reference or running actors still mount. Dry-run
 mutates nothing at all — not even the lazy size-file backfill.
 
-**In-flight pulls need no separate protection.** `EnsureImage` writes
-the image record **before** unpacking (the way Go allocates black during
-GC and containerd creates its ingest record before the bytes land), so
-every layer a pull produces is referenced — and kept fresh by a
-per-layer progress touch — from before it exists on disk. An interrupted
-pull's record is resumable progress, not garbage: the next pull of that
-digest re-fetches only the missing layers, and a pull that never resumes
-ages out through ordinary LRU.
+**In-flight pulls.** `EnsureImage` writes the image record **before**
+unpacking (the way Go allocates black during GC and containerd creates
+its ingest record before the bytes land), so every layer a pull produces
+is referenced — and kept fresh by a per-layer progress touch — from
+before it exists on disk. The pull also pins each of its layers until it
+returns, and eviction never retires a pinned layer, so a layer the pull
+has unpacked or reused cannot be taken from under it even if its record
+ages out meanwhile. An interrupted pull's record is resumable progress,
+not garbage: the next pull of that digest re-fetches only the missing
+layers, and a pull that never resumes ages out through ordinary LRU.
 
 **Startup recovery.** A layer no record references can only be crash
 debris (eviction interrupted between record-delete and layer-rename) or
@@ -271,15 +275,16 @@ fails to read. There is no online whole-pool scan (ext4's split: bounded
 recovery at mount, fsck offline).
 
 **Deletion is two-phase.** A layer is atomically renamed to `.rm-*`
-inside the layer's singleflight (one `rename(2)` — eviction can never
-stall a pull), then removed asynchronously; a crash in between leaves
-the dir for the startup sweep. This matters because the kernel offers no
-protection here: deleting a directory that is a live overlay lowerdir in
-another mount namespace succeeds silently, leaves the overlay's behavior
-undefined, and doesn't even free the space until the mount goes away.
+under the pin lock, and never while a pull has it pinned (a pull waits
+on eviction for at most one stat and one `rename(2)`), then removed
+asynchronously; a crash in between leaves the dir for the startup sweep.
+This matters because the kernel offers no protection here: deleting a
+directory that is a live overlay lowerdir in another mount namespace
+succeeds silently, leaves the overlay's behavior undefined, and doesn't
+even free the space until the mount goes away.
 
-Deleting the cache root by hand (while no actors are starting) remains
-safe — the store re-pulls whatever is missing.
+Deleting the cache root by hand (while no actors are running on the node)
+remains safe — the store re-pulls whatever is missing.
 
 This is Phase 2 of [#463](https://github.com/agent-substrate/substrate/issues/463);
 the watermark loop, flags, and cache metrics complete it. Phase 3 adds
@@ -298,11 +303,10 @@ restructuring.
   rewriting, options. End-to-end pull tests run against an in-memory
   registry (`pkg/registry`).
 - Linux-tagged tests (`bundle_linux_test.go`): unprivileged ones cover
-  escape rejection, owner-fixup resolution and specless compose; root-gated
-  ones execute the real `mknod`/xattr materialization and a full mount →
-  write-isolation → owner-fixup → unmount round trip (including recursive
-  upper ownership reset; actor writes land in the bundle upper, never in the
-  shared pool).
+  escape rejection and specless/zero-layer compose; root-gated ones execute
+  the real `mknod`/xattr materialization and a full mount → write-isolation
+  → unmount round trip (the write-isolation assertion — actor writes land in
+  the bundle upper, never in the shared pool — is the key safety property).
   The root-gated ones self-skip via `roottest.Require`; CI (and
   `hack/run-root-tests.sh` locally) reruns the package under `sudo` so they
   execute.

@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ package validate_test
 import (
 	"testing"
 
-	"github.com/agent-substrate/substrate/tools/apitool/internal/exemption"
-	"github.com/agent-substrate/substrate/tools/apitool/internal/validate"
+	"go.ate.dev/substrate/tools/apitool/internal/exemption"
+	"go.ate.dev/substrate/tools/apitool/internal/validate"
 )
 
 func TestExemptions(t *testing.T) {

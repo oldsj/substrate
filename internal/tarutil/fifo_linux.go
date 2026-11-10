@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ func createFifo(root *os.Root, name string, mode os.FileMode) error {
 // Device nodes matter here because overlayfs records a deleted lower-layer
 // file as a 0:0 character device ("whiteout") in the upper — dropping one at
 // extraction would resurrect the deleted file on restore. mknod requires
-// privilege; extraction runs as root in ateom, and the tests gate on it.
+// privilege; extraction runs as root in worker, and the tests gate on it.
 func createDevice(root *os.Root, name string, hdr *tar.Header, mode os.FileMode) error {
 	dir, base := filepath.Split(name)
 	if dir == "" {

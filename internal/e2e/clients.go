@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/ateclient"
-	"github.com/agent-substrate/substrate/pkg/client/clientset/versioned"
+	"go.ate.dev/substrate/internal/ateclient"
+	"go.ate.dev/substrate/pkg/client/clientset/versioned"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/client-go/kubernetes"
 )
@@ -69,7 +69,7 @@ func NewClients(ctx context.Context) (*Clients, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	apiClient, err := ateclient.NewClient(connectCtx, KubeConfig, KubeContext, "", "", false)
+	apiClient, err := ateclient.NewClient(connectCtx, KubeConfig, KubeContext, "", "", false, previewDialOptions()...)
 	if err != nil {
 		return nil, fmt.Errorf("NewClient: %w", err)
 	}

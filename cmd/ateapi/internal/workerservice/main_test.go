@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ package workerservice
 import (
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
 )
 
 func TestMain(m *testing.M) {

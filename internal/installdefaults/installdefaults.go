@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,20 +32,34 @@ const (
 	APIServiceName = "api"
 	// RouterServiceName is the Service name of atenet-router.
 	RouterServiceName = "atenet-router"
+	// IDPServiceName is the Service name of ate-idp-server.
+	IDPServiceName = "idp"
 	// ClientServiceAccount is the ServiceAccount an out-of-cluster client mints
 	// its ateapi bearer token from.
 	ClientServiceAccount = "ate-client"
 
 	// AteletTrustDomain and the ServiceAccount constants are the trust-domain
 	// and service-account segments of the SPIFFE IDs that atelet,
-	// atenet-router and atenet-egress Pod certificates carry, as minted by the
-	// podidentity signer (cmd/podcertcontroller/internal/podidentitysigner).
+	// atenet-router, atenet-egress and ate-controller Pod certificates carry,
+	// as minted by the podidentity signer
+	// (cmd/podcertcontroller/internal/podidentitysigner).
 	// The namespace segment is the namespace they run in, which callers
 	// resolve themselves rather than assume.
-	AteletTrustDomain    = "cluster.local"
-	AteletServiceAccount = "atelet"
-	RouterServiceAccount = "atenet-router"
-	EgressServiceAccount = "atenet-egress"
+	AteletTrustDomain        = "cluster.local"
+	AteletServiceAccount     = "atelet"
+	RouterServiceAccount     = "atenet-router"
+	EgressServiceAccount     = "atenet-egress"
+	ControllerServiceAccount = "ate-controller"
+	APIServerServiceAccount  = "ate-api-server"
+
+	// TransferServiceAccountName is the default name of the Google service
+	// account snapshot transfers run as on GCS, which substrate-gke's
+	// tools/setup-gcp creates.
+	TransferServiceAccountName = "ate-snapshot-transfer"
+
+	// WorkerServiceAccount is what worker pods run as when their WorkerPool
+	// names none; atecontroller creates it in the pool's namespace.
+	WorkerServiceAccount = "ateworker"
 
 	// PodNamespaceEnv is the conventional env var name for the namespace
 	// a pod is running in, exposed via Kubernetes' downward API.
@@ -60,6 +74,29 @@ func NamespaceFromPodEnv() string {
 		return ns
 	}
 	return SystemNamespace
+}
+
+// ActorJWTIssuer returns the actor JWT issuer for an install in namespace that
+// does not configure one: the in-cluster URL of its ate-idp-server Service.
+// Relying parties bind trust to this exact string.
+func ActorJWTIssuer(namespace string) string {
+	return (&url.URL{
+		Scheme: "https",
+		Host:   IDPServiceName + "." + namespace + ".svc",
+	}).String()
+}
+
+// APIServiceHost returns the in-cluster DNS name of ate-api-server's Service
+// in namespace, the name on its serving certificate.
+func APIServiceHost(namespace string) string {
+	return APIServiceName + "." + namespace + ".svc"
+}
+
+// ClientPrincipal returns the principal ID ate-api-server sees for a bearer
+// token minted from ClientServiceAccount in namespace: the Kubernetes
+// ServiceAccount username in the token's subject.
+func ClientPrincipal(namespace string) string {
+	return "system:serviceaccount:" + namespace + ":" + ClientServiceAccount
 }
 
 // SPIFFEID returns the SPIFFE ID that Pod certificates for serviceAccount in
@@ -86,4 +123,15 @@ func RouterSPIFFEID(namespace string) string {
 // namespace. The credential provider verifies it on the injector connection.
 func EgressSPIFFEID(namespace string) string {
 	return SPIFFEID(namespace, EgressServiceAccount)
+}
+
+// ControllerSPIFFEID returns the SPIFFE ID ate-controller presents when it runs in namespace.
+func ControllerSPIFFEID(namespace string) string {
+	return SPIFFEID(namespace, ControllerServiceAccount)
+}
+
+// APIServerSPIFFEID returns the SPIFFE ID the ate-api-server pod presents when
+// it runs in namespace. Its objectstore-plugin sidecar shares it.
+func APIServerSPIFFEID(namespace string) string {
+	return SPIFFEID(namespace, APIServerServiceAccount)
 }

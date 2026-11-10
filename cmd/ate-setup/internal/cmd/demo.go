@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/demos"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/demos"
 	// Registers every bundled demo; see the package doc.
-	_ "github.com/agent-substrate/substrate/cmd/ate-setup/internal/demos/all"
+	_ "go.ate.dev/substrate/cmd/ate-setup/internal/demos/all"
 )
 
 // demoArg is the short name a demo is addressed by on the command line:
@@ -31,8 +32,9 @@ func demoArg(d demos.Demo) string {
 }
 
 var deployDemoCmd = &cobra.Command{
-	Use:   "demo",
-	Short: "Deploy a bundled demo",
+	Annotations: map[string]string{recordAnnotation: "no"},
+	Use:         "demo",
+	Short:       "Deploy a bundled demo",
 }
 
 var deleteDemoCmd = &cobra.Command{
@@ -54,12 +56,16 @@ func init() {
 			Short: demo.Description(),
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
+				if err := env.RequireControlPlane(cmd.Context()); err != nil {
+					return err
+				}
 				return demo.Deploy(cmd.Context(), env)
 			},
 		}
-		// Demo flags bind to the demo value itself, so they must be registered
-		// on the deploy command only: the delete path never reads them.
-		demo.Flags(deploy.Flags())
+		// demos.Register already registered the settings; only the flag
+		// binding needs the command, and it goes on deploy alone because the
+		// delete path never reads it.
+		config.BindCommandFlags(demos.DeployCommandPath(demo), deploy.Flags())
 		deployDemoCmd.AddCommand(deploy)
 
 		deleteDemoCmd.AddCommand(&cobra.Command{
@@ -67,7 +73,11 @@ func init() {
 			Short: "Delete " + demo.Name(),
 			Args:  cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				return demo.Delete(cmd.Context(), env)
+				namespaces, err := demo.Delete(cmd.Context(), env)
+				if err != nil {
+					return err
+				}
+				return env.WaitNamespacesDeleted(cmd.Context(), namespaces)
 			},
 		})
 	}

@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,8 +64,8 @@ WORKDIR /src
 COPY benchmarking/locust/codegen/requirements.txt benchmarking/locust/codegen/
 RUN pip install --no-cache-dir -r benchmarking/locust/codegen/requirements.txt
 COPY benchmarking/locust/codegen/generate.sh benchmarking/locust/codegen/
-COPY pkg/proto pkg/proto
-RUN PYTHON=python3 OUT_DIR=/out benchmarking/locust/codegen/generate.sh pkg/proto/ateapipb/ateapi.proto
+COPY api api
+RUN PYTHON=python3 OUT_DIR=/out benchmarking/locust/codegen/generate.sh api/ateapi/v1/ateapi.proto
 
 # --- Stage 3: runtime -------------------------------------------------------
 # nighthawk-dev has no stable tags; pinned by digest so the pull is

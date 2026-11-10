@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,14 +19,14 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 // setSpanActorAttributes annotates the RPC's server span (from ctx) with the
 // actor's full identity. A no-op when ctx carries no recording span.
-func setSpanActorAttributes(ctx context.Context, a *ateapipb.Actor) {
+func setSpanActorAttributes(ctx context.Context, a *ateapi.Actor) {
 	trace.SpanFromContext(ctx).SetAttributes(ateattr.ActorAttributes(a)...)
 }
 

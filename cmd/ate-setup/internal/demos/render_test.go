@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ package demos_test
 import (
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/demos"
-	_ "github.com/agent-substrate/substrate/cmd/ate-setup/internal/demos/all"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/demos/demotest"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/demos"
+	_ "go.ate.dev/substrate/cmd/ate-setup/internal/demos/all"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/demos/demotest"
 )
 
 // TestDemoTemplatesRender guards against drift between the demo templates and

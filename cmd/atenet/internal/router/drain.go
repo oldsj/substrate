@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/serverboot"
+	"go.ate.dev/substrate/internal/serverboot"
 )
 
 // defaultDrainCompleteFile is where the drain sequence leaves its completion

@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
 )
 
 // EnsureClusterCredentials fetches GKE credentials when the configuration
@@ -40,6 +41,7 @@ func (c *Config) EnsureClusterCredentials(ctx context.Context) error {
 	}
 
 	log.Stepf("gcloud container clusters get-credentials %s", c.ClusterName)
+	defer log.Elapsed(time.Now(), "gcloud get-credentials")
 	cmd := exec.CommandContext(ctx, "gcloud", "container", "clusters", "get-credentials",
 		c.ClusterName,
 		"--location", c.ClusterLocation,

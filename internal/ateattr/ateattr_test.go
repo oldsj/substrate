@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,11 +21,11 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/resources"
 
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 )
 
 func toMap(kvs []attribute.KeyValue) map[attribute.Key]attribute.Value {
@@ -68,14 +68,14 @@ func assertAttrs(t *testing.T, got map[attribute.Key]attribute.Value, want map[a
 func TestActorAttributes(t *testing.T) {
 	tests := []struct {
 		name  string
-		actor *ateapipb.Actor
+		actor *ateapi.Actor
 		want  map[attribute.Key]any
 	}{
 		{
 			name: "full actor",
-			actor: &ateapipb.Actor{
-				Metadata:      &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "support-agent-42", Uid: "uid-abc", Version: 7},
-				ActorTemplate: &ateapipb.ObjectRef{Atespace: "ate-agents", Name: "support-agent"},
+			actor: &ateapi.Actor{
+				Metadata:      &ateapi.ResourceMetadata{Atespace: "team-a", Name: "support-agent-42", Uid: "uid-abc", Version: 7},
+				ActorTemplate: &ateapi.ObjectRef{Atespace: "ate-agents", Name: "support-agent"},
 			},
 			want: map[attribute.Key]any{
 				AtespaceKey:         "team-a",
@@ -160,7 +160,7 @@ func TestKeySpellings(t *testing.T) {
 		{WorkerStateKey, "ate.worker.state"},
 		{SandboxClassKey, "ate.sandbox.class"},
 		{SnapshotKindKey, "ate.snapshot.kind"},
-		{SnapshotScopeKey, "ate.snapshot.scope"},
+		{SnapshotFidelityKey, "ate.snapshot.fidelity"},
 		{SnapshotPhaseKey, "ate.snapshot.phase"},
 		{ImageCacheOutcomeKey, "ate.imagecache.outcome"},
 		{SchedulerOutcomeKey, "ate.scheduler.outcome"},
@@ -377,8 +377,8 @@ func TestMetricLabelValues(t *testing.T) {
 		{OperationCreate, "create"},
 		{OperationResume, "resume"},
 		{OperationSuspend, "suspend"},
-		{OperationPause, "pause"},
 		{OperationDelete, "delete"},
+		{OperationRevert, "revert"},
 		{OperationUnknown, "unknown"},
 
 		{ImageCacheOutcomeHit, "hit"},
@@ -388,27 +388,27 @@ func TestMetricLabelValues(t *testing.T) {
 		{ImageCacheOutcomeTimeout, "timeout"},
 
 		{SchedulerOutcomeAssigned, "assigned"},
-		{SchedulerOutcomeNoFreeWorker, "no_free_worker"},
+		{SchedulerOutcomeNoCapacity, "no_capacity"},
 		{SchedulerOutcomeError, "error"},
 
-		{SnapshotKindGolden, "golden"},
 		{SnapshotKindLatest, "latest"},
 		{SnapshotKindLocal, "local"},
 		{SnapshotKindBoot, "boot"},
 
-		{SnapshotScopeFull, "full"},
-		{SnapshotScopeData, "data"},
-		{SnapshotScopeDataOnGolden, "data_on_golden"},
-		{SnapshotScopeUnknown, "unknown"},
+		{SnapshotFidelityMemory, "memory"},
+		{SnapshotFidelityVolumes, "volumes"},
+		{SnapshotFidelityRootfs, "rootfs"},
+		{SnapshotFidelityUnknown, "unknown"},
 
 		{SnapshotPhaseVolumeMount, "volume_mount"},
 		{SnapshotPhaseManifestFetch, "manifest_fetch"},
 		{SnapshotPhaseSandboxAssets, "sandbox_assets"},
 		{SnapshotPhaseDownload, "download"},
 		{SnapshotPhaseOCIUnpack, "oci_unpack"},
-		{SnapshotPhaseAteomRestore, "ateom_restore"},
-		{SnapshotPhaseAteomCheckpoint, "ateom_checkpoint"},
+		{SnapshotPhaseWorkerRestore, "worker_restore"},
+		{SnapshotPhaseWorkerCheckpoint, "worker_checkpoint"},
 		{SnapshotPhasePersist, "persist"},
+		{SnapshotPhaseCleanup, "cleanup"},
 		{SnapshotPhaseTotal, "total"},
 
 		{SandboxClassUnknown, "unknown"},
@@ -429,10 +429,10 @@ func TestMetricLabelValues(t *testing.T) {
 }
 
 func TestActorMetricAttributes(t *testing.T) {
-	actor := &ateapipb.Actor{
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "counter-template"},
-		Status: &ateapipb.ActorStatus{
-			WorkerAssignment: &ateapipb.WorkerAssignment{
+	actor := &ateapi.Actor{
+		ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "counter-template"},
+		Status: &ateapi.ActorStatus{
+			WorkerAssignment: &ateapi.WorkerAssignment{
 				WorkerNamespace: "ate-workers",
 				WorkerPool:      "default-pool",
 			},
@@ -467,8 +467,8 @@ func TestActorMetricAttributes(t *testing.T) {
 		assertAttrs(t, got, want)
 	})
 
-	// releaseWorker gives an empty class when the worker record is gone.
-	// CreateWorker can also store one. Empty is not a permitted value.
+	// The class is empty when the actor's worker assignment is already clear or
+	// carries no sandbox runtime. Empty is not a permitted value.
 	t.Run("empty sandbox class is normalized to unknown", func(t *testing.T) {
 		got := toMap(ActorMetricAttributes(actor, "", OperationResume))
 		want := map[attribute.Key]any{
@@ -498,9 +498,9 @@ func TestActorMetricAttributes(t *testing.T) {
 	})
 
 	t.Run("empty template ref reports empty labels", func(t *testing.T) {
-		noTemplate := &ateapipb.Actor{
-			Status: &ateapipb.ActorStatus{
-				WorkerAssignment: &ateapipb.WorkerAssignment{
+		noTemplate := &ateapi.Actor{
+			Status: &ateapi.ActorStatus{
+				WorkerAssignment: &ateapi.WorkerAssignment{
 					WorkerNamespace: "ate-workers",
 					WorkerPool:      "default-pool",
 				},
@@ -523,8 +523,8 @@ func TestActorMetricAttributes(t *testing.T) {
 	// one key of the pair, or an empty-string name, would put that crash in a
 	// series that looks like a real pool.
 	t.Run("unassigned actor omits both pool keys", func(t *testing.T) {
-		unassigned := &ateapipb.Actor{
-			ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "counter-template"},
+		unassigned := &ateapi.Actor{
+			ActorTemplate: &ateapi.ObjectRef{Atespace: "default", Name: "counter-template"},
 		}
 		got := toMap(ActorMetricAttributes(unassigned, "gvisor", OperationCreate))
 		want := map[attribute.Key]any{
@@ -569,25 +569,25 @@ func TestWorkerPoolAttributes(t *testing.T) {
 	})
 }
 
-// TestSnapshotScopeValue pins the enum-to-label mapping ateapi and atelet share.
+// TestSnapshotFidelityValue pins the enum-to-label mapping ateapi and atelet share.
 // An unmapped enum value must report unknown rather than its stringified form,
 // which would let a wire value widen the label set.
-func TestSnapshotScopeValue(t *testing.T) {
+func TestSnapshotFidelityValue(t *testing.T) {
 	tests := []struct {
 		name  string
-		scope ateletpb.SnapshotScope
+		scope ateletpb.SnapshotFidelity
 		want  string
 	}{
-		{name: "full", scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_FULL, want: SnapshotScopeFull},
-		{name: "data", scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA, want: SnapshotScopeData},
-		{name: "data on golden", scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA_ON_GOLDEN, want: SnapshotScopeDataOnGolden},
-		{name: "unspecified", scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_UNSPECIFIED, want: SnapshotScopeUnknown},
-		{name: "value outside the enum", scope: ateletpb.SnapshotScope(9999), want: SnapshotScopeUnknown},
+		{name: "memory", scope: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, want: SnapshotFidelityMemory},
+		{name: "volumes", scope: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, want: SnapshotFidelityVolumes},
+		{name: "rootfs", scope: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS, want: SnapshotFidelityRootfs},
+		{name: "unspecified", scope: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED, want: SnapshotFidelityUnknown},
+		{name: "value outside the enum", scope: ateletpb.SnapshotFidelity(9999), want: SnapshotFidelityUnknown},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := SnapshotScopeValue(tt.scope); got != tt.want {
-				t.Errorf("SnapshotScopeValue(%v) = %q, want %q", tt.scope, got, tt.want)
+			if got := SnapshotFidelityValue(tt.scope); got != tt.want {
+				t.Errorf("SnapshotFidelityValue(%v) = %q, want %q", tt.scope, got, tt.want)
 			}
 		})
 	}
@@ -603,8 +603,6 @@ func TestActorStateValues(t *testing.T) {
 		{ActorStateRunning, "running"},
 		{ActorStateSuspending, "suspending"},
 		{ActorStateSuspended, "suspended"},
-		{ActorStatePausing, "pausing"},
-		{ActorStatePaused, "paused"},
 		{ActorStateCrashed, "crashed"},
 		{ActorStateDeleting, "deleting"},
 		{ActorStateDeleted, "deleted"},
@@ -624,20 +622,18 @@ func TestActorStateValues(t *testing.T) {
 func TestActorStateValue(t *testing.T) {
 	tests := []struct {
 		name  string
-		state ateapipb.ActorState
+		state ateapi.ActorState
 		want  string
 	}{
-		{name: "resuming", state: ateapipb.ActorState_ACTOR_STATE_RESUMING, want: ActorStateResuming},
-		{name: "running", state: ateapipb.ActorState_ACTOR_STATE_RUNNING, want: ActorStateRunning},
-		{name: "suspending", state: ateapipb.ActorState_ACTOR_STATE_SUSPENDING, want: ActorStateSuspending},
-		{name: "suspended", state: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, want: ActorStateSuspended},
-		{name: "pausing", state: ateapipb.ActorState_ACTOR_STATE_PAUSING, want: ActorStatePausing},
-		{name: "paused", state: ateapipb.ActorState_ACTOR_STATE_PAUSED, want: ActorStatePaused},
-		{name: "crashed", state: ateapipb.ActorState_ACTOR_STATE_CRASHED, want: ActorStateCrashed},
-		{name: "deleting", state: ateapipb.ActorState_ACTOR_STATE_DELETING, want: ActorStateDeleting},
-		{name: "reverting", state: ateapipb.ActorState_ACTOR_STATE_REVERTING, want: ActorStateReverting},
-		{name: "unspecified", state: ateapipb.ActorState_ACTOR_STATE_UNSPECIFIED, want: ActorStateUnknown},
-		{name: "value outside the enum", state: ateapipb.ActorState(9999), want: ActorStateUnknown},
+		{name: "resuming", state: ateapi.ActorState_ACTOR_STATE_RESUMING, want: ActorStateResuming},
+		{name: "running", state: ateapi.ActorState_ACTOR_STATE_RUNNING, want: ActorStateRunning},
+		{name: "suspending", state: ateapi.ActorState_ACTOR_STATE_SUSPENDING, want: ActorStateSuspending},
+		{name: "suspended", state: ateapi.ActorState_ACTOR_STATE_SUSPENDED, want: ActorStateSuspended},
+		{name: "crashed", state: ateapi.ActorState_ACTOR_STATE_CRASHED, want: ActorStateCrashed},
+		{name: "deleting", state: ateapi.ActorState_ACTOR_STATE_DELETING, want: ActorStateDeleting},
+		{name: "reverting", state: ateapi.ActorState_ACTOR_STATE_REVERTING, want: ActorStateReverting},
+		{name: "unspecified", state: ateapi.ActorState_ACTOR_STATE_UNSPECIFIED, want: ActorStateUnknown},
+		{name: "value outside the enum", state: ateapi.ActorState(9999), want: ActorStateUnknown},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -665,8 +661,6 @@ func TestActorStateValuesMirrorActorState(t *testing.T) {
 		ActorStateRunning:    true,
 		ActorStateSuspending: true,
 		ActorStateSuspended:  true,
-		ActorStatePausing:    true,
-		ActorStatePaused:     true,
 		ActorStateCrashed:    true,
 		ActorStateDeleting:   true,
 		ActorStateReverting:  true,
@@ -675,8 +669,8 @@ func TestActorStateValuesMirrorActorState(t *testing.T) {
 	}
 
 	want := map[string]bool{}
-	for value, name := range ateapipb.ActorState_name {
-		if ateapipb.ActorState(value) == ateapipb.ActorState_ACTOR_STATE_UNSPECIFIED {
+	for value, name := range ateapi.ActorState_name {
+		if ateapi.ActorState(value) == ateapi.ActorState_ACTOR_STATE_UNSPECIFIED {
 			continue
 		}
 		want[strings.ToLower(strings.TrimPrefix(name, "ACTOR_STATE_"))] = true
@@ -684,12 +678,12 @@ func TestActorStateValuesMirrorActorState(t *testing.T) {
 
 	for state := range want {
 		if !got[state] {
-			t.Errorf("ateapipb.ActorState has %q with no ateattr constant", state)
+			t.Errorf("ateapi.ActorState has %q with no ateattr constant", state)
 		}
 	}
 	for state := range got {
 		if !want[state] && !noEnumCounterpart[state] {
-			t.Errorf("ateattr has state %q that ateapipb.ActorState does not", state)
+			t.Errorf("ateattr has state %q that ateapi.ActorState does not", state)
 		}
 	}
 }
@@ -703,8 +697,8 @@ func TestNormalizeSandboxClass(t *testing.T) {
 		class string
 		want  string
 	}{
-		{name: "gvisor", class: string(atev1alpha1.SandboxClassGvisor), want: string(atev1alpha1.SandboxClassGvisor)},
-		{name: "microvm", class: string(atev1alpha1.SandboxClassMicroVM), want: string(atev1alpha1.SandboxClassMicroVM)},
+		{name: "gvisor", class: string(atev1.SandboxClassGvisor), want: string(atev1.SandboxClassGvisor)},
+		{name: "microvm", class: string(atev1.SandboxClassMicroVM), want: string(atev1.SandboxClassMicroVM)},
 		{name: "empty", class: "", want: SandboxClassUnknown},
 		{name: "unknown runtime", class: "kvm", want: SandboxClassUnknown},
 		{name: "casing is not normalized away", class: "GVISOR", want: SandboxClassUnknown},
@@ -727,8 +721,9 @@ func TestNormalizeOperationName(t *testing.T) {
 		{OperationCreate, OperationCreate},
 		{OperationResume, OperationResume},
 		{OperationSuspend, OperationSuspend},
-		{OperationPause, OperationPause},
+		{"pause", OperationUnknown},
 		{OperationDelete, OperationDelete},
+		{OperationRevert, OperationRevert},
 		{"", OperationUnknown},
 		{"invalid", OperationUnknown},
 		{"crash", OperationUnknown},

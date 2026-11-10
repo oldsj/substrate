@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
 )
 
 // TestSaveWorker_RejectsAStaleWrite proves the precondition saveWorker states
@@ -30,7 +30,7 @@ func TestSaveWorker_RejectsAStaleWrite(t *testing.T) {
 	requirePool(t)
 	ctx := context.Background()
 
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -38,8 +38,8 @@ func TestSaveWorker_RejectsAStaleWrite(t *testing.T) {
 	defer p.Close()
 	clearAll(t, p)
 
-	created, err := p.CreateWorker(ctx, &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: "stale-write-worker"},
+	created, err := p.CreateWorker(ctx, &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: "stale-write-worker"},
 		WorkerNamespace: "ns",
 		WorkerPool:      "pool",
 		WorkerPod:       "pod",
@@ -49,8 +49,8 @@ func TestSaveWorker_RejectsAStaleWrite(t *testing.T) {
 	}
 
 	// Move the stored Worker on, so the copy above is a version behind.
-	if _, err := p.UpdateWorker(ctx, created.GetMetadata().GetName(), store.PreconditionFrom(created), func(toUpdate *ateapipb.Worker) error {
-		toUpdate.Ip = "10.0.0.1"
+	if _, err := p.UpdateWorker(ctx, created.GetMetadata().GetName(), store.PreconditionFrom(created), func(toUpdate *ateapi.Worker) error {
+		toUpdate.Labels = map[string]string{"tier": "batch"}
 		return nil
 	}); err != nil {
 		t.Fatalf("UpdateWorker failed: %v", err)
@@ -72,7 +72,7 @@ func TestSaveWorker_RejectsAVanishedWorker(t *testing.T) {
 	requirePool(t)
 	ctx := context.Background()
 
-	p, err := Connect(ctx, containerDSN, "public")
+	p, err := Connect(ctx, testConnectConfig("public"))
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
 	}
@@ -80,8 +80,8 @@ func TestSaveWorker_RejectsAVanishedWorker(t *testing.T) {
 	defer p.Close()
 	clearAll(t, p)
 
-	created, err := p.CreateWorker(ctx, &ateapipb.Worker{
-		Metadata:        &ateapipb.ResourceMetadata{Name: "vanished-worker"},
+	created, err := p.CreateWorker(ctx, &ateapi.Worker{
+		Metadata:        &ateapi.ResourceMetadata{Name: "vanished-worker"},
 		WorkerNamespace: "ns",
 		WorkerPool:      "pool",
 		WorkerPod:       "pod",

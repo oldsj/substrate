@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,38 +16,32 @@ package networking
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
-	"net/netip"
-	"os"
-	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/e2e"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/e2e"
+	"go.ate.dev/substrate/internal/resources"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // The EgressPolicy half of egress: the other TestActorEgress* tests give their
 // actors an allow-everything policy and prove traffic flows; these give theirs
-// a narrow one and prove what does not. A request either gateway can read is
-// decided per request, the rules in order over its Host and the address the
-// actor dialed. Opaque TCP, and TLS on the plain gateway, are decided by
-// address alone at the CONNECT.
-
-// egressMITM reports whether the suite runs against the sdsmint gateway.
-func egressMITM() bool { return os.Getenv("E2E_EGRESS_MITM") != "" }
+// a narrow one and prove what does not. A request the gateway can read is
+// decided per request on its Host, by the http rules in the clear and the
+// https rules once decrypted.
 
 // notTransient stops the retry loop on anything but the 503 a request sees
 // while the actor's route is still propagating; a denial is a final answer.
 func notTransient(status int, _ []byte) bool { return status != http.StatusServiceUnavailable }
 
 // reached stops the retry loop only on success. A lane expecting the fetch to
-// work sees more transients than the 503 above (the sdsmint leaf fails
-// verification until kubelet has propagated the CA pool, public origins
-// hiccup), all of them 502s the actor cannot tell from a denial.
+// work sees more transients than the 503 above (the minted leaf fails
+// verification until kubelet has propagated the CA pool), all of them 502s the
+// actor cannot tell from a denial.
 func reached(status int, _ []byte) bool { return status == http.StatusOK }
 
 // TestActorEgressPolicyDeniesUnlistedHost: the policy names one hostname, so
@@ -60,7 +54,7 @@ func TestActorEgressPolicyDeniesUnlistedHost(t *testing.T) {
 	target := e2e.DeployServerPod(t, ctx, origin)
 	allowed := fmt.Sprintf("%s.%s.svc.cluster.local", origin.Name, target.Namespace)
 
-	actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-policy", egressFixture(), e2e.EgressAllowHostnames(allowed))
+	_, actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-policy", e2e.EgressFixture(), e2e.EgressAllowHTTP(allowed))
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
@@ -85,7 +79,7 @@ func TestActorEgressRequiresPolicy(t *testing.T) {
 	dataplane := e2e.CurrentAtenetDataplane()
 	target := e2e.DeployServerPod(t, ctx, egressHTTPTarget())
 
-	actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-nopolicy", egressFixture())
+	_, actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-nopolicy", e2e.EgressFixture())
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
@@ -103,138 +97,243 @@ func TestActorEgressRequiresPolicy(t *testing.T) {
 	t.Logf("egress was denied as expected: %s", body)
 }
 
-// TestActorEgressPolicyAllowsByAddress: the policy names the origin's address
-// only. Both gateways allow the fetch by address, and the same origin by name,
-// because the request is checked against the address the actor dialed and
-// sent there. A name that resolves to any other address is denied.
-func TestActorEgressPolicyAllowsByAddress(t *testing.T) {
+// TestActorEgressHTTPSByHostname: the policy allows one origin by name for
+// interception and another for passthrough, and the gateway handles each the
+// way its rule says and refuses a name no rule lists.
+//
+// Both origins serve service-DNS certificates, which the gateway trusts and
+// the actor does not, so the certificate the actor verifies tells the two
+// paths apart.
+func TestActorEgressHTTPSByHostname(t *testing.T) {
 	ctx := context.Background()
 	dataplane := e2e.CurrentAtenetDataplane()
+
+	const mitmBody, passthroughBody = "mitm origin", "passthrough origin"
+	mitm := e2e.DeployServerPod(t, ctx, egressHTTPSTarget("mitm-origin", mitmBody))
+	passthroughSpec := egressHTTPSTarget("passthrough-origin", passthroughBody)
+	passthroughSpec.Namespace = mitm.Namespace
+	passthrough := e2e.DeployServerPod(t, ctx, passthroughSpec)
+
+	// Include an HTTP rule for the .cluster.local FQDNs so cluster DNS search-path
+	// resolution succeeds while port 443 TLS rules still match only SvcName().
+	_, actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-sni", e2e.EgressFixture(),
+		e2e.EgressAllowHTTP(mitm.SvcName()+".cluster.local", passthrough.SvcName()+".cluster.local"),
+		e2e.EgressAllowHTTPS(mitm.SvcName()),
+		e2e.EgressAllowPassthrough(passthrough.SvcName()),
+	)
+	router := mustRouterClient(t, ctx)
+	defer router.Close()
+	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
+	waitForActorRoute(t, ctx, router, actorRef)
+
+	t.Run("mitm", func(t *testing.T) {
+		// The actor's default roots hold the gateway's CA but not the
+		// service-DNS signer, so a verified fetch means the gateway minted the
+		// leaf the actor saw.
+		url := "https://" + mitm.SvcName() + "/healthz"
+		status, body := fetchThroughEgressActorUntil(t, ctx, router, actorRef, url, reached)
+		if status != http.StatusOK {
+			t.Fatalf("fetch of %s returned HTTP %d, want 200; body: %s", url, status, body)
+		}
+		if got := decodeEgressFetch(t, body); got.Body != mitmBody || !got.TLS {
+			t.Errorf("fetch of %s = %+v, want verified TLS and body %q", url, got, mitmBody)
+		}
+	})
+
+	t.Run("passthrough", func(t *testing.T) {
+		// Trusting only the service-DNS signer, the fetch verifies against the
+		// origin's own certificate alone, which an intercepting gateway would
+		// have replaced with a minted leaf.
+		url := "https://" + passthrough.SvcName() + "/healthz"
+		payload, err := json.Marshal(map[string]string{"url": url, "rootCA": e2e.ServiceDNSTrustBundle(t, ctx, e2e.GetClients())})
+		if err != nil {
+			t.Fatalf("marshaling the fetch request for %s: %v", url, err)
+		}
+		status, body := postThroughEgressActorUntil(t, ctx, router, actorRef, "/", payload, reached)
+		if status != http.StatusOK {
+			t.Fatalf("fetch of %s returned HTTP %d, want 200; body: %s", url, status, body)
+		}
+		if got := decodeEgressFetch(t, body); got.Body != passthroughBody || !got.TLS {
+			t.Errorf("fetch of %s = %+v, want verified TLS and body %q", url, got, passthroughBody)
+		}
+	})
+
+	t.Run("unlisted host denied", func(t *testing.T) {
+		// The MITM origin by its fully qualified name, which no rule lists
+		// (rules match names exactly) and its certificate does not cover. A
+		// gateway that wrongly intercepted it fails upstream with a 503; one
+		// that wrongly passed it through hands the actor that certificate.
+		url := "https://" + mitm.SvcName() + ".cluster.local/healthz"
+		status, body := fetchThroughEgressActorUntil(t, ctx, router, actorRef, url, notTransient)
+		if !dataplane.IsEgressPolicyDenied(status, string(body)) {
+			t.Fatalf("fetch of %s, outside the policy, returned HTTP %d, want an egress-policy denial; body: %s", url, status, body)
+		}
+		// Denied TLS closes at ClientHello, which the actor reports as
+		// the same 502 as any failed fetch; a certificate error in it means the
+		// handshake reached the origin.
+		if got := decodeEgressFetch(t, body); strings.Contains(got.Error, "x509") || strings.Contains(got.Error, "certificate") {
+			t.Fatalf("fetch of %s, outside the policy, failed certificate verification instead of being denied, so the gateway passed it through; body: %s", url, body)
+		}
+		t.Logf("fetch of %s was denied as expected: %s", url, body)
+	})
+}
+
+// This test validates that TLS passthrough connection is denied when policy changes
+// even if there are outstanding connections that were allowed by the previous policy.
+func TestActorEgressPassthroughPolicyRefresh(t *testing.T) {
+	ctx := t.Context()
+	dataplane := e2e.CurrentAtenetDataplane()
+	origin, address, rootCA := prepareProtocolOrigin(t, ctx, e2e.ServerPod{
+		Name:       "passthrough-origin",
+		ImportPath: "go.ate.dev/substrate/internal/e2e/fixtures/testserver",
+		Args:       []string{"http"},
+		Port:       80,
+		TargetPort: 8080,
+		TLSPort:    443,
+	}, true)
+
+	actorAtespace, actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-passthrough-refresh", e2e.EgressFixture(), e2e.EgressAllowPassthrough("*"))
+	router := mustRouterClient(t, ctx)
+	defer router.Close()
+	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
+	waitForActorRoute(t, ctx, router, actorRef)
+
+	// Ask egres actor to POST to /fetch on the test server. Test server /fetch handler
+	// waits for the entire body before responding.
+	url := "https://" + address + "/fetch"
+	postPayload, err := json.Marshal(map[string]string{"url": url, "rootCA": rootCA})
+	if err != nil {
+		t.Fatalf("marshaling /post request: %v", err)
+	}
+
+	type postResult struct {
+		status int
+		body   []byte
+	}
+	since := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+	firstResult := make(chan postResult, 1)
+	go func() {
+		status, body := postThroughEgressActorUntil(t, ctx, router, actorRef, "/post", postPayload, notTransient)
+		firstResult <- postResult{status: status, body: body}
+	}()
+
+	// Allow connection to be fully established before changing the policy.
+	assertEgressGatewayConnect(t, ctx, since, actorAtespace, actorName, "443")
+
+	// Keep DNS authorized so the second connection tests the PEP, not the DNS relay.
+	e2e.EnsureEgressPolicy(t, ctx, e2e.GetClients(), actorRef.ToObjectRef(), e2e.EgressAllowHTTP(origin.SvcName()+".cluster.local"))
+	// Wait for the policy cached in ext_proc server to expire, so it will fetch the new one.
+	// ext_proc cache freshness interval is 10 seconds.
+	time.Sleep(11 * time.Second)
+
+	status, body := postThroughEgressActorUntil(t, ctx, router, actorRef, "/post", postPayload, notTransient)
+	if !dataplane.IsEgressPolicyDenied(status, string(body)) {
+		t.Fatalf("second POST to %s after policy update returned HTTP %d, want an egress-policy denial; body: %s", url, status, body)
+	}
+
+	first := <-firstResult
+	if first.status != http.StatusOK {
+		t.Fatalf("first POST to %s returned HTTP %d, want 200; body: %s", url, first.status, first.body)
+	}
+}
+
+func TestActorEgressPendingPlaintextHeadersDoNotBlockMITM(t *testing.T) {
+	ctx := t.Context()
+	const mitmBody = "mitm origin"
+	mitm := e2e.DeployServerPod(t, ctx, egressHTTPSTarget("mitm-origin", mitmBody))
+	plaintextSpec := egressHTTPTarget()
+	plaintextSpec.Namespace = mitm.Namespace
+	plaintext := e2e.DeployServerPod(t, ctx, plaintextSpec)
+
+	actorAtespace, actorName, _ := createAndResumeActorWithEgress(
+		t, ctx, "egress-slow-headers", e2e.EgressFixture(),
+		e2e.EgressAllowHTTPS(mitm.SvcName(), mitm.SvcName()+".cluster.local"),
+		e2e.EgressAllowHTTP(plaintext.SvcName(), plaintext.SvcName()+".cluster.local"),
+	)
+	router := mustRouterClient(t, ctx)
+	defer router.Close()
+	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
+	waitForActorRoute(t, ctx, router, actorRef)
+
+	plaintextURL := "http://" + plaintext.SvcName() + "/healthz"
+	slowPayload, err := json.Marshal(map[string]string{"url": plaintextURL})
+	if err != nil {
+		t.Fatalf("marshaling /slow-headers request: %v", err)
+	}
+
+	type postResult struct {
+		status int
+		body   []byte
+	}
+	since := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+	pendingResult := make(chan postResult, 1)
+	go func() {
+		status, body := postThroughEgressActorUntil(t, ctx, router, actorRef, "/slow-headers", slowPayload, notTransient)
+		pendingResult <- postResult{status: status, body: body}
+	}()
+
+	// Allow the plaintext request to send its incomplete headers before issuing the MITM request.
+	assertEgressGatewayConnect(t, ctx, since, actorAtespace, actorName, "80")
+
+	mitmURL := "https://" + mitm.SvcName() + "/healthz"
+	status, body := fetchThroughEgressActorUntil(t, ctx, router, actorRef, mitmURL, reached)
+	if status != http.StatusOK {
+		t.Fatalf("fetch of %s returned HTTP %d, want 200; body: %s", mitmURL, status, body)
+	}
+	if got := decodeEgressFetch(t, body); got.Body != mitmBody || !got.TLS {
+		t.Fatalf("fetch of %s = %+v, want verified TLS and body %q", mitmURL, got, mitmBody)
+	}
+
+	pending := <-pendingResult
+	if pending.status != http.StatusOK {
+		t.Fatalf("fetch of %s returned HTTP %d, want 200; body: %s", plaintextURL, pending.status, pending.body)
+	}
+}
+
+// TestActorDNSRequiresPolicy: the sandbox's DNS relay denies the queries of an
+// actor with no EgressPolicy or for a host outside its policy, and answers them
+// once a rule in the policy matches the host, without a restart.
+func TestActorDNSRequiresPolicy(t *testing.T) {
+	ctx := context.Background()
 	origin := egressHTTPTarget()
 	target := e2e.DeployServerPod(t, ctx, origin)
-	block := netip.MustParseAddr(target.ClusterIP)
-	cidr := netip.PrefixFrom(block, block.BitLen()).String()
+	name := fmt.Sprintf("%s.%s.svc.cluster.local", origin.Name, target.Namespace)
+	url := "http://" + name + "/healthz"
 
-	actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-address", egressFixture(), e2e.EgressAllowCIDRs(cidr))
-	router := mustRouterClient(t, ctx)
-	defer router.Close()
-	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
-
-	url := fmt.Sprintf("http://%s/healthz", target.Address())
-	status, body := fetchThroughEgressActor(t, ctx, router, actorRef, url)
-	if status != http.StatusOK {
-		t.Fatalf("fetch of the allowed address %s returned HTTP %d, want 200; body: %s", url, status, body)
-	}
-
-	url = fmt.Sprintf("http://%s.%s.svc.cluster.local/healthz", origin.Name, target.Namespace)
-	status, body = fetchThroughEgressActor(t, ctx, router, actorRef, url)
-	if status != http.StatusOK {
-		t.Fatalf("fetch of the allowed address by name %s returned HTTP %d, want 200; body: %s", url, status, body)
-	}
-
-	// The API server's ClusterIP is outside the block, and the policy has no
-	// hostname rule that could allow a request inside, so the request is denied.
-	url = "http://kubernetes.default.svc.cluster.local/healthz"
-	status, body = fetchThroughEgressActorUntil(t, ctx, router, actorRef, url, notTransient)
-	if !dataplane.IsEgressPolicyDenied(status, string(body)) {
-		t.Fatalf("fetch of an address outside the policy %s returned HTTP %d, want an egress-policy denial; body: %s", url, status, body)
-	}
-	t.Logf("egress to an address outside the policy was denied as expected: %s", body)
-}
-
-// hostnamePolicyActor creates an actor whose policy names example.com and
-// nothing else, and waits until it is routable.
-func hostnamePolicyActor(t *testing.T, ctx context.Context) (*e2e.RouterClient, resources.ActorRef) {
-	t.Helper()
-	actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-sni", egressFixture(), e2e.EgressAllowHostnames("example.com"))
-	router := mustRouterClient(t, ctx)
-	t.Cleanup(func() { router.Close() })
-	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
-	waitForActorRoute(t, ctx, router, actorRef)
-	return router, actorRef
-}
-
-// TestActorEgressHTTPSByHostnameMITM: sdsmint terminates the TLS and decides
-// each request by name: example.com 200, example.org 403.
-func TestActorEgressHTTPSByHostnameMITM(t *testing.T) {
-	if !egressMITM() {
-		t.Skip("covers the sdsmint gateway; set E2E_EGRESS_MITM")
-	}
-	ctx := context.Background()
-	dataplane := e2e.CurrentAtenetDataplane()
-	router, actorRef := hostnamePolicyActor(t, ctx)
-
-	status, body := fetchThroughEgressActorUntil(t, ctx, router, actorRef, "https://example.com/", reached)
-	if status != http.StatusOK {
-		t.Fatalf("fetch of the allowed host returned HTTP %d, want 200; body: %s", status, body)
-	}
-	status, body = fetchThroughEgressActorUntil(t, ctx, router, actorRef, "https://example.org/", notTransient)
-	if !dataplane.IsEgressPolicyDenied(status, string(body)) {
-		t.Fatalf("fetch of a host outside the policy returned HTTP %d, want an egress-policy denial; body: %s", status, body)
-	}
-	t.Logf("denied on the decrypted request: %s", body)
-}
-
-// TestActorEgressHTTPSByHostnamePassthrough: the plain gateway cannot read
-// TLS, and no address rule allows either destination, so both connections are
-// closed before a byte reaches an origin, the allowed name included. The demo
-// app reports each as a 502.
-func TestActorEgressHTTPSByHostnamePassthrough(t *testing.T) {
-	if egressMITM() {
-		t.Skip("covers the plain gateway; sdsmint is TestActorEgressHTTPSByHostnameMITM")
-	}
-	if !e2e.CurrentAtenetDataplane().SupportsTLSPassthroughEgressPolicy() {
-		t.Skip("TODO: AgentGateway must enforce substrateEgress for TLS passthrough")
-	}
-	ctx := context.Background()
-	router, actorRef := hostnamePolicyActor(t, ctx)
-
-	for _, url := range []string{"https://example.com/", "https://example.org/"} {
-		status, body := fetchThroughEgressActorUntil(t, ctx, router, actorRef, url, notTransient)
-		if status != http.StatusBadGateway || !strings.Contains(string(body), "request failed") {
-			t.Fatalf("fetch of %s returned HTTP %d, want a failed fetch (502) from a tunnel closed before the handshake; body: %s", url, status, body)
-		}
-	}
-	t.Log("both tunnels closed before the handshake")
-}
-
-// TestActorEgressHTTPSByAddress: the policy names the addresses example.com
-// resolves to and no hostname. The plain gateway decides HTTPS by address at
-// the CONNECT. sdsmint decides the decrypted request, which the address rule
-// allows, and sends it to the dialed address with the origin's certificate
-// checked against the name. Both fetch.
-func TestActorEgressHTTPSByAddress(t *testing.T) {
-	ctx := context.Background()
-	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", "example.com")
-	if err != nil || len(addrs) == 0 {
-		t.Fatalf("resolving example.com: %v", err)
-	}
-	// The actor resolves the name itself. Allow the blocks around every
-	// address seen here, so a rotation within the origin's ranges between the
-	// two lookups does not fail the test. Addresses often share a block, and
-	// the API refuses a repeated CIDR.
-	var cidrs []string
-	for _, addr := range addrs {
-		bits := 24
-		if addr.Unmap().Is6() {
-			bits = 48
-		}
-		cidr := netip.PrefixFrom(addr.Unmap(), bits).Masked().String()
-		if !slices.Contains(cidrs, cidr) {
-			cidrs = append(cidrs, cidr)
-		}
-	}
-
-	actorName, _ := createAndResumeActorWithEgress(t, ctx, "egress-ipblock", egressFixture(), e2e.EgressAllowCIDRs(cidrs...))
+	_, actorName, _ := createAndResumeActorWithEgress(t, ctx, "dns-nopolicy", e2e.EgressFixture())
 	router := mustRouterClient(t, ctx)
 	defer router.Close()
 	actorRef := resources.ActorRef{Atespace: networkingAtespace, Name: actorName}
 	waitForActorRoute(t, ctx, router, actorRef)
 
-	status, body := fetchThroughEgressActorUntil(t, ctx, router, actorRef, "https://example.com/", reached)
-	if status != http.StatusOK {
-		t.Fatalf("fetch of an allowed address returned HTTP %d, want 200 (allowed %v); body: %s", status, cidrs, body)
+	status, body := fetchThroughEgressActorUntil(t, ctx, router, actorRef, url, notTransient)
+	if status != http.StatusBadGateway || !isDeniedLookup(string(body), name) {
+		t.Fatalf("fetch of %s by an actor with no policy returned HTTP %d, want its lookup denied; body: %s", url, status, body)
 	}
+	t.Logf("lookup was denied as expected: %s", body)
+
+	// The relay fetches the policy again within seconds, so the retries below
+	// see it. A wildcard rule covering the target namespace's Services allows
+	// name while still refusing an unlisted host.
+	wildcard := fmt.Sprintf("*.%s.svc.cluster.local", target.Namespace)
+	e2e.EnsureEgressPolicy(t, ctx, e2e.GetClients(), actorRef.ToObjectRef(), e2e.EgressAllowHTTP(wildcard))
+	status, body = fetchThroughEgressActorUntil(t, ctx, router, actorRef, url, reached)
+	if status != http.StatusOK {
+		t.Fatalf("fetch of %s after the actor was given a policy returned HTTP %d, want 200; body: %s", url, status, body)
+	}
+
+	const unlisted = "unlisted.example.com"
+	status, body = fetchThroughEgressActorUntil(t, ctx, router, actorRef, "http://"+unlisted+"/healthz", notTransient)
+	if status != http.StatusBadGateway || !isDeniedLookup(string(body), unlisted) {
+		t.Fatalf("fetch of unlisted host %s returned HTTP %d, want its lookup denied; body: %s", unlisted, status, body)
+	}
+}
+
+// isDeniedLookup reports whether body is the egress demo's report of a lookup
+// of name that the DNS relay denied. The relay answers NXDOMAIN, which Go's
+// resolver reports as "no such host".
+func isDeniedLookup(body, name string) bool {
+	return strings.Contains(body, "lookup "+name) && strings.Contains(body, "no such host")
 }
 
 // fetchThroughEgressActorUntil is fetchThroughEgressActor with the caller

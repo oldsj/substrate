@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"encoding/pem"
 	"fmt"
 
-	"github.com/agent-substrate/substrate/internal/localca"
+	"go.ate.dev/substrate/internal/localca"
 )
 
 // CAPoolRootPEM extracts a CA pool Secret's root certificates and returns them

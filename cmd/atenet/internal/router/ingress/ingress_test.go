@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,18 +33,19 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
-	"github.com/agent-substrate/substrate/internal/atenet"
-	"github.com/agent-substrate/substrate/internal/atunnel"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/atenet"
+	atunnelingress "go.ate.dev/substrate/internal/atunnel/ingress"
 )
 
 type mockClient struct {
-	ateapipb.ControlClient
-	resumeFn func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error)
+	ateapi.ControlClient
+	resumeFn func(ctx context.Context, in *ateapi.ResumeActorRequest, opts ...grpc.CallOption) (*ateapi.ResumeActorResponse, error)
 }
 
-func (m *mockClient) ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+func (m *mockClient) ResumeActor(ctx context.Context, in *ateapi.ResumeActorRequest, opts ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
 	return m.resumeFn(ctx, in, opts...)
 }
 
@@ -57,15 +58,15 @@ func requestMetadata(actorName, atespace string, headers ...*corev3.HeaderValue)
 
 func TestHandleRequestHeadersAcceptsMixedCaseRoutingHeaders(t *testing.T) {
 	clientMock := &mockClient{
-		resumeFn: func(_ context.Context, in *ateapipb.ResumeActorRequest, _ ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+		resumeFn: func(_ context.Context, in *ateapi.ResumeActorRequest, _ ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
 			if got, want := in.GetActor().GetName(), "actor-1"; got != want {
 				t.Errorf("actor name = %q, want %q", got, want)
 			}
 			if got, want := in.GetActor().GetAtespace(), "team-a"; got != want {
 				t.Errorf("atespace = %q, want %q", got, want)
 			}
-			return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{
-				Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}},
+			return &ateapi.ResumeActorResponse{Actor: &ateapi.Actor{
+				Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"10.0.0.52"}}},
 			}}, nil
 		},
 	}
@@ -76,6 +77,121 @@ func TestHandleRequestHeadersAcceptsMixedCaseRoutingHeaders(t *testing.T) {
 
 	if _, err := h.HandleRequestHeaders(context.Background(), md); err != nil {
 		t.Fatalf("HandleRequestHeaders() error = %v", err)
+	}
+}
+
+func TestHandleRequestHeadersRejectsDuplicateOrCommaHeaders(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers []*corev3.HeaderValue
+		attrs   map[string]*structpb.Struct
+	}{
+		{
+			name: "duplicate headers with different values",
+			headers: []*corev3.HeaderValue{
+				{Key: atenet.TargetActorHeader, Value: "demo/a"},
+				{Key: atenet.TargetActorHeader, Value: "secret/x"},
+			},
+		},
+		{
+			name: "duplicate headers with identical values",
+			headers: []*corev3.HeaderValue{
+				{Key: atenet.TargetActorHeader, Value: "demo/a"},
+				{Key: atenet.TargetActorHeader, Value: "demo/a"},
+			},
+		},
+		{
+			name: "single header with comma-joined value",
+			headers: []*corev3.HeaderValue{
+				{Key: atenet.TargetActorHeader, Value: "demo/a,secret/x"},
+			},
+		},
+		{
+			name: "filter state attribute with comma-joined value",
+			attrs: map[string]*structpb.Struct{
+				"envoy.filters.http.ext_proc": {
+					Fields: map[string]*structpb.Value{
+						extproc.TargetActorFilterStateAttribute: structpb.NewStringValue("demo/a,secret/x"),
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resumeCalls int32
+			clientMock := &mockClient{
+				resumeFn: func(_ context.Context, _ *ateapi.ResumeActorRequest, _ ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
+					atomic.AddInt32(&resumeCalls, 1)
+					return nil, errors.New("should not be called")
+				},
+			}
+			h := New(clientMock, ParkedRequestConfig{}, nil)
+			md := extproc.NewRequestMetadata(tt.headers, tt.attrs)
+
+			_, err := h.HandleRequestHeaders(context.Background(), md)
+			if err == nil {
+				t.Fatalf("HandleRequestHeaders() succeeded, want 404 error")
+			}
+			var reqErr *extproc.ReqError
+			if !errors.As(err, &reqErr) {
+				t.Fatalf("error = %v, want *extproc.ReqError", err)
+			}
+			if reqErr.StatusCode != int(envoy_type.StatusCode_NotFound) {
+				t.Errorf("StatusCode = %d, want %d", reqErr.StatusCode, envoy_type.StatusCode_NotFound)
+			}
+			if !strings.Contains(reqErr.Error(), "invalid actor reference") {
+				t.Errorf("error string = %q, want containing %q", reqErr.Error(), "invalid actor reference")
+			}
+			if calls := atomic.LoadInt32(&resumeCalls); calls != 0 {
+				t.Errorf("ResumeActor called %d times, want 0", calls)
+			}
+		})
+	}
+}
+
+func TestHandleRequestHeadersConnectAttributeOverridesInnerHeader(t *testing.T) {
+	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+	var gotActorRef string
+	clientMock := &mockClient{
+		resumeFn: func(_ context.Context, in *ateapi.ResumeActorRequest, _ ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
+			gotActorRef = in.GetActor().GetAtespace() + "/" + in.GetActor().GetName()
+			return &ateapi.ResumeActorResponse{Actor: &ateapi.Actor{
+				Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"10.0.0.52"}}},
+			}}, nil
+		},
+	}
+	h := New(clientMock, ParkedRequestConfig{}, nil)
+	md := extproc.NewRequestMetadata(
+		[]*corev3.HeaderValue{
+			{Key: atenet.TargetActorHeader, Value: "secret/x"},
+		},
+		map[string]*structpb.Struct{
+			"envoy.filters.http.ext_proc": {
+				Fields: map[string]*structpb.Value{
+					extproc.TargetActorFilterStateAttribute: structpb.NewStringValue("team-a/" + testUUID),
+				},
+			},
+		},
+	)
+
+	res, err := h.HandleRequestHeaders(context.Background(), md)
+	if err != nil {
+		t.Fatalf("HandleRequestHeaders() error = %v", err)
+	}
+
+	if got, want := gotActorRef, "team-a/"+testUUID; got != want {
+		t.Errorf("ResumeActor called with %q, want %q", got, want)
+	}
+
+	mutation := res.Response.GetResponse().GetHeaderMutation()
+	gotMutations := map[string]string{}
+	for _, headerOption := range mutation.GetSetHeaders() {
+		gotMutations[strings.ToLower(headerOption.Header.Key)] = string(headerOption.Header.RawValue)
+	}
+	if got, want := gotMutations[strings.ToLower(atenet.TargetActorHeader)], "team-a/"+testUUID; got != want {
+		t.Errorf("actor target mutation = %q, want %q", got, want)
 	}
 }
 
@@ -91,6 +207,15 @@ func dynamicMetadataPort(dynamicMetadata *structpb.Struct) string {
 	return dynamicMetadata.GetFields()[OriginalDstMetadataKey].GetStructValue().GetFields()[OriginalDstPortKey].GetStringValue()
 }
 
+// testWorkerSPIFFEID is the SPIFFE ID the test assignments give their worker.
+const testWorkerSPIFFEID = "spiffe://cluster.local/ns/workers/sa/substrate-worker"
+
+// dynamicMetadataWorkerSPIFFEID extracts the SPIFFE ID HandleRequestHeaders
+// requires of atunnel.
+func dynamicMetadataWorkerSPIFFEID(dynamicMetadata *structpb.Struct) string {
+	return dynamicMetadata.GetFields()[OriginalDstMetadataKey].GetStructValue().GetFields()[WorkerSPIFFEIDKey].GetStringValue()
+}
+
 func TestHandleRequestHeadersDoesNotLogSensitiveData(t *testing.T) {
 	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
 	const secret = "do-not-log-me"
@@ -102,8 +227,8 @@ func TestHandleRequestHeadersDoesNotLogSensitiveData(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	h := New(&mockClient{
-		resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-			return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}}}}, nil
+		resumeFn: func(ctx context.Context, in *ateapi.ResumeActorRequest, opts ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
+			return &ateapi.ResumeActorResponse{Actor: &ateapi.Actor{Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"10.0.0.52"}}}}}, nil
 		},
 	}, ParkedRequestConfig{}, nil)
 
@@ -147,7 +272,7 @@ func TestHandleRequestHeaders(t *testing.T) {
 		actorName          string
 		atespace           string
 		authority          string
-		resumeResp         *ateapipb.ResumeActorResponse
+		resumeResp         *ateapi.ResumeActorResponse
 		resumeErr          error
 		expectErr          bool
 		expectedErrStr     string
@@ -175,9 +300,9 @@ func TestHandleRequestHeaders(t *testing.T) {
 		{
 			name:           "FailedPrecondition maps to 503 with preserved desc",
 			authority:      testUUID + ".team-a.actors.resources.substrate.ate.dev",
-			resumeErr:      status.Error(codes.FailedPrecondition, "no free workers available"),
+			resumeErr:      status.Error(codes.FailedPrecondition, "no worker has room for the actor"),
 			expectErr:      true,
-			expectedErrStr: `actor team-a/123e4567-e89b-12d3-a456-426614174000 unavailable: no free workers available`,
+			expectedErrStr: `actor team-a/123e4567-e89b-12d3-a456-426614174000 unavailable: no worker has room for the actor`,
 			expectedStatus: envoy_type.StatusCode_ServiceUnavailable,
 		},
 		{
@@ -207,9 +332,33 @@ func TestHandleRequestHeaders(t *testing.T) {
 		{
 			name:      "Bad Actor IP from resume returns 500 without leaking IP",
 			authority: testUUID + ".team-a.actors.resources.substrate.ate.dev",
-			resumeResp: &ateapipb.ResumeActorResponse{
-				Actor: &ateapipb.Actor{
-					Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "invalid-ip"}},
+			resumeResp: &ateapi.ResumeActorResponse{
+				Actor: &ateapi.Actor{
+					Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"invalid-ip"}}},
+				},
+			},
+			expectErr:      true,
+			expectedErrStr: `actor team-a/123e4567-e89b-12d3-a456-426614174000 routing failed`,
+			expectedStatus: envoy_type.StatusCode_InternalServerError,
+		},
+		{
+			name:      "No Actor IPs from resume returns 500",
+			authority: testUUID + ".team-a.actors.resources.substrate.ate.dev",
+			resumeResp: &ateapi.ResumeActorResponse{
+				Actor: &ateapi.Actor{
+					Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{}},
+				},
+			},
+			expectErr:      true,
+			expectedErrStr: `actor team-a/123e4567-e89b-12d3-a456-426614174000 routing failed`,
+			expectedStatus: envoy_type.StatusCode_InternalServerError,
+		},
+		{
+			name:      "No worker SPIFFE ID from resume returns 500",
+			authority: testUUID + ".team-a.actors.resources.substrate.ate.dev",
+			resumeResp: &ateapi.ResumeActorResponse{
+				Actor: &ateapi.Actor{
+					Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerPodIps: []string{"10.0.0.52"}}},
 				},
 			},
 			expectErr:      true,
@@ -219,13 +368,25 @@ func TestHandleRequestHeaders(t *testing.T) {
 		{
 			name:      "successful resume ignores host and port for actor routing",
 			authority: "127.0.0.1:44681",
-			resumeResp: &ateapipb.ResumeActorResponse{
-				Actor: &ateapipb.Actor{
-					Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}},
+			resumeResp: &ateapi.ResumeActorResponse{
+				Actor: &ateapi.Actor{
+					Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"10.0.0.52"}}},
 				},
 			},
 			expectErr:          false,
 			expectedTarget:     "10.0.0.52:443",
+			expectedTargetPort: "80",
+		},
+		{
+			name:      "dual-stack resume routes to the first IP",
+			authority: "127.0.0.1:44681",
+			resumeResp: &ateapi.ResumeActorResponse{
+				Actor: &ateapi.Actor{
+					Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"fd00::52", "10.0.0.52"}}},
+				},
+			},
+			expectErr:          false,
+			expectedTarget:     "[fd00::52]:443",
 			expectedTargetPort: "80",
 		},
 	}
@@ -241,7 +402,7 @@ func TestHandleRequestHeaders(t *testing.T) {
 				atespace = "team-a"
 			}
 			clientMock := &mockClient{
-				resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+				resumeFn: func(ctx context.Context, in *ateapi.ResumeActorRequest, opts ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
 					if in.GetActor().GetName() != testUUID {
 						t.Errorf("unexpected identifier parsed in test context: %s", in.GetActor().GetName())
 					}
@@ -301,7 +462,7 @@ func TestHandleRequestHeaders(t *testing.T) {
 			for _, headerOption := range mutation.GetSetHeaders() {
 				gotMutations[strings.ToLower(headerOption.Header.Key)] = string(headerOption.Header.RawValue)
 			}
-			if _, ok := gotMutations[strings.ToLower(atunnel.TargetPortHeader)]; ok {
+			if _, ok := gotMutations[strings.ToLower(atunnelingress.TargetPortHeader)]; ok {
 				t.Errorf("target port must be emitted only as dynamic metadata")
 			}
 			if got, want := gotMutations[strings.ToLower(atenet.TargetActorHeader)], "team-a/"+testUUID; got != want {
@@ -313,6 +474,9 @@ func TestHandleRequestHeaders(t *testing.T) {
 			if got := dynamicMetadataPort(res.DynamicMetadata); got != tc.expectedTargetPort {
 				t.Errorf("dynamic metadata port = %q, want %q", got, tc.expectedTargetPort)
 			}
+			if got, want := dynamicMetadataWorkerSPIFFEID(res.DynamicMetadata), testWorkerSPIFFEID; got != want {
+				t.Errorf("dynamic metadata worker SPIFFE ID = %q, want %q", got, want)
+			}
 		})
 	}
 }
@@ -323,14 +487,14 @@ func TestHandleRequestHeaders(t *testing.T) {
 // produces the same "<workerIP>:443" original-dst mutation as an ordinary
 // request (the router only ever dials the worker's atunnel server), and
 // reports the arbitrary port itself in dynamic metadata for Envoy to write to
-// atunnel.TargetPortHeader.
+// atunnelingress.TargetPortHeader.
 func TestHandleRequestHeadersHandlesConnectMethod(t *testing.T) {
 	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
 	authority := testUUID + ".team-a.actors.resources.substrate.ate.dev:9090"
 
 	clientMock := &mockClient{
-		resumeFn: func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-			return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}}}}, nil
+		resumeFn: func(ctx context.Context, in *ateapi.ResumeActorRequest, opts ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
+			return &ateapi.ResumeActorResponse{Actor: &ateapi.Actor{Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"10.0.0.52"}}}}}, nil
 		},
 	}
 	h := New(clientMock, ParkedRequestConfig{}, nil)
@@ -361,9 +525,9 @@ func TestHandleRequestHeadersHandlesConnectMethod(t *testing.T) {
 func TestHandleRequestHeadersUsesRetainedConnectAuthorityForPort(t *testing.T) {
 	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
 	clientMock := &mockClient{
-		resumeFn: func(context.Context, *ateapipb.ResumeActorRequest, ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
-			return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{
-				Status: &ateapipb.ActorStatus{WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.52"}},
+		resumeFn: func(context.Context, *ateapi.ResumeActorRequest, ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
+			return &ateapi.ResumeActorResponse{Actor: &ateapi.Actor{
+				Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"10.0.0.52"}}},
 			}}, nil
 		},
 	}
@@ -371,11 +535,11 @@ func TestHandleRequestHeadersUsesRetainedConnectAuthorityForPort(t *testing.T) {
 		"envoy.filters.http.ext_proc": {
 			Fields: map[string]*structpb.Value{
 				extproc.ConnectAuthorityFilterStateAttribute: structpb.NewStringValue("unrelated.example:9090"),
+				extproc.TargetActorFilterStateAttribute:      structpb.NewStringValue("team-a/" + testUUID),
 			},
 		},
 	}
 	md := extproc.NewRequestMetadata([]*corev3.HeaderValue{
-		{Key: atenet.TargetActorHeader, Value: "team-a/" + testUUID},
 		{Key: ":authority", Value: "inner.example"},
 	}, attrs)
 
@@ -385,6 +549,177 @@ func TestHandleRequestHeadersUsesRetainedConnectAuthorityForPort(t *testing.T) {
 	}
 	if got, want := dynamicMetadataPort(res.DynamicMetadata), "9090"; got != want {
 		t.Errorf("target port = %q, want %q", got, want)
+	}
+
+	mutation := res.Response.GetResponse().GetHeaderMutation()
+	gotMutations := map[string]string{}
+	for _, headerOption := range mutation.GetSetHeaders() {
+		gotMutations[strings.ToLower(headerOption.Header.Key)] = string(headerOption.Header.RawValue)
+	}
+	if got, want := gotMutations[strings.ToLower(atenet.TargetActorHeader)], "team-a/"+testUUID; got != want {
+		t.Errorf("actor target mutation = %q, want %q", got, want)
+	}
+}
+
+func TestHandleRequestHeadersConnectRequiresOuterTargetActor(t *testing.T) {
+	const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+	tests := []struct {
+		name           string
+		headers        []*corev3.HeaderValue
+		attrs          map[string]*structpb.Struct
+		expectErr      bool
+		wantStatusCode int
+		wantActorRef   string
+	}{
+		{
+			name: "connect request with no outer target actor and inner header is rejected",
+			headers: []*corev3.HeaderValue{
+				{Key: atenet.TargetActorHeader, Value: "team-a/" + testUUID},
+				{Key: ":authority", Value: "inner.example"},
+			},
+			attrs: map[string]*structpb.Struct{
+				"envoy.filters.http.ext_proc": {
+					Fields: map[string]*structpb.Value{
+						extproc.ConnectAuthorityFilterStateAttribute: structpb.NewStringValue("unrelated.example:9090"),
+					},
+				},
+			},
+			expectErr:      true,
+			wantStatusCode: int(envoy_type.StatusCode_NotFound),
+		},
+		{
+			name: "connect request with empty outer target actor and inner header is rejected",
+			headers: []*corev3.HeaderValue{
+				{Key: atenet.TargetActorHeader, Value: "team-a/" + testUUID},
+				{Key: ":authority", Value: "inner.example"},
+			},
+			attrs: map[string]*structpb.Struct{
+				"envoy.filters.http.ext_proc": {
+					Fields: map[string]*structpb.Value{
+						extproc.ConnectAuthorityFilterStateAttribute: structpb.NewStringValue("unrelated.example:9090"),
+						extproc.TargetActorFilterStateAttribute:      structpb.NewStringValue(""),
+					},
+				},
+			},
+			expectErr:      true,
+			wantStatusCode: int(envoy_type.StatusCode_NotFound),
+		},
+		{
+			name: "connect request with no outer target actor and no inner header is rejected",
+			headers: []*corev3.HeaderValue{
+				{Key: ":authority", Value: "inner.example"},
+			},
+			attrs: map[string]*structpb.Struct{
+				"envoy.filters.http.ext_proc": {
+					Fields: map[string]*structpb.Value{
+						extproc.ConnectAuthorityFilterStateAttribute: structpb.NewStringValue("unrelated.example:9090"),
+					},
+				},
+			},
+			expectErr:      true,
+			wantStatusCode: int(envoy_type.StatusCode_NotFound),
+		},
+		{
+			name: "connect request with comma-separated outer target actor is rejected",
+			headers: []*corev3.HeaderValue{
+				{Key: ":authority", Value: "inner.example"},
+			},
+			attrs: map[string]*structpb.Struct{
+				"envoy.filters.http.ext_proc": {
+					Fields: map[string]*structpb.Value{
+						extproc.ConnectAuthorityFilterStateAttribute: structpb.NewStringValue("unrelated.example:9090"),
+						extproc.TargetActorFilterStateAttribute:      structpb.NewStringValue("team-a/a,team-b/b"),
+					},
+				},
+			},
+			expectErr:      true,
+			wantStatusCode: int(envoy_type.StatusCode_NotFound),
+		},
+		{
+			name: "connect request with outer target actor resolves even if inner header is omitted",
+			headers: []*corev3.HeaderValue{
+				{Key: ":authority", Value: "inner.example"},
+			},
+			attrs: map[string]*structpb.Struct{
+				"envoy.filters.http.ext_proc": {
+					Fields: map[string]*structpb.Value{
+						extproc.ConnectAuthorityFilterStateAttribute: structpb.NewStringValue("unrelated.example:9090"),
+						extproc.TargetActorFilterStateAttribute:      structpb.NewStringValue("team-a/" + testUUID),
+					},
+				},
+			},
+			expectErr:    false,
+			wantActorRef: "team-a/" + testUUID,
+		},
+		{
+			name: "connect request with outer target actor X overrides inner header Y",
+			headers: []*corev3.HeaderValue{
+				{Key: atenet.TargetActorHeader, Value: "team-b/untrusted-actor"},
+				{Key: ":authority", Value: "inner.example"},
+			},
+			attrs: map[string]*structpb.Struct{
+				"envoy.filters.http.ext_proc": {
+					Fields: map[string]*structpb.Value{
+						extproc.ConnectAuthorityFilterStateAttribute: structpb.NewStringValue("unrelated.example:9090"),
+						extproc.TargetActorFilterStateAttribute:      structpb.NewStringValue("team-a/" + testUUID),
+					},
+				},
+			},
+			expectErr:    false,
+			wantActorRef: "team-a/" + testUUID,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotActorRef string
+			var resumeCalls int32
+			clientMock := &mockClient{
+				resumeFn: func(_ context.Context, in *ateapi.ResumeActorRequest, _ ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
+					atomic.AddInt32(&resumeCalls, 1)
+					gotActorRef = in.GetActor().GetAtespace() + "/" + in.GetActor().GetName()
+					return &ateapi.ResumeActorResponse{Actor: &ateapi.Actor{
+						Status: &ateapi.ActorStatus{WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"10.0.0.52"}}},
+					}}, nil
+				},
+			}
+
+			h := New(clientMock, ParkedRequestConfig{}, nil)
+			md := extproc.NewRequestMetadata(tt.headers, tt.attrs)
+
+			res, err := h.HandleRequestHeaders(context.Background(), md)
+			if tt.expectErr {
+				if err == nil {
+					t.Fatalf("HandleRequestHeaders() succeeded, want error")
+				}
+				var reqErr *extproc.ReqError
+				if !errors.As(err, &reqErr) {
+					t.Fatalf("error = %v, want *extproc.ReqError", err)
+				}
+				if reqErr.StatusCode != tt.wantStatusCode {
+					t.Errorf("StatusCode = %d, want %d", reqErr.StatusCode, tt.wantStatusCode)
+				}
+				if calls := atomic.LoadInt32(&resumeCalls); calls != 0 {
+					t.Errorf("ResumeActor called %d times, want 0", calls)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("HandleRequestHeaders() error = %v", err)
+			}
+			if got, want := gotActorRef, tt.wantActorRef; got != want {
+				t.Errorf("ResumeActor called with %q, want %q", got, want)
+			}
+			mutation := res.Response.GetResponse().GetHeaderMutation()
+			gotMutations := map[string]string{}
+			for _, headerOption := range mutation.GetSetHeaders() {
+				gotMutations[strings.ToLower(headerOption.Header.Key)] = string(headerOption.Header.RawValue)
+			}
+			if got, want := gotMutations[strings.ToLower(atenet.TargetActorHeader)], tt.wantActorRef; got != want {
+				t.Errorf("actor target mutation = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -401,15 +736,15 @@ func TestHandleRequestHeaders_FullLotServesRunningActor(t *testing.T) {
 	clientMock := &mockClient{
 		resumeFn: func(
 			ctx context.Context,
-			in *ateapipb.ResumeActorRequest,
+			in *ateapi.ResumeActorRequest,
 			opts ...grpc.CallOption,
-		) (*ateapipb.ResumeActorResponse, error) {
+		) (*ateapi.ResumeActorResponse, error) {
 			resumeCalled = true
-			return &ateapipb.ResumeActorResponse{
-				Actor: &ateapipb.Actor{
-					Status: &ateapipb.ActorStatus{
-						State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
-						WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: "10.0.0.1"},
+			return &ateapi.ResumeActorResponse{
+				Actor: &ateapi.Actor{
+					Status: &ateapi.ActorStatus{
+						State:            ateapi.ActorState_ACTOR_STATE_RUNNING,
+						WorkerAssignment: &ateapi.WorkerAssignment{WorkerSpiffeId: testWorkerSPIFFEID, WorkerPodIps: []string{"10.0.0.1"}},
 					},
 				},
 			}, nil
@@ -419,7 +754,7 @@ func TestHandleRequestHeaders_FullLotServesRunningActor(t *testing.T) {
 	// A 1-slot lot with the slot already occupied deterministically simulates a
 	// full lot without needing a concurrent in-flight request.
 	h := New(clientMock, ParkedRequestConfig{Budget: time.Second, Max: 1}, nil)
-	release, ok := h.parking.enter(context.Background())
+	release, ok := h.parking.enter(context.Background(), ateattr.RouterOutcomeUnavailable)
 	if !ok {
 		t.Fatal("priming enter should be admitted")
 	}
@@ -445,29 +780,29 @@ func TestHandleRequestHeaders_FullLotServesRunningActor(t *testing.T) {
 	}
 }
 
-// TestHandleRequestHeaders_FullLotShedsParkedRequest verifies the other half
-// of lot admission: when the lot is full, a request whose resume actually
-// parks (first retryable failure) is shed with 503 "router at capacity" — at
-// the park transition, after its single initial attempt, not before any.
-func TestHandleRequestHeaders_FullLotShedsParkedRequest(t *testing.T) {
+// TestHandleRequestHeaders_FailedPreconditionFailsFast completes the full-lot
+// trio: a FailedPrecondition from ResumeActor neither parks nor is shed. The
+// request fails after its single attempt with the resume error, and the full
+// lot never sees it.
+func TestHandleRequestHeaders_FailedPreconditionFailsFast(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const testUUID = "123e4567-e89b-12d3-a456-426614174000"
 		authority := testUUID + ".team-a.actors.resources.substrate.ate.dev"
+		const desc = "AssignWorker prerequisite not met for Actor: team-a/" + testUUID + " (got: ACTOR_STATE_CRASHED, want ACTOR_STATE_SUSPENDED)"
 
 		var resumeCalls atomic.Int32
 		clientMock := &mockClient{
-			resumeFn: func(
-				ctx context.Context,
-				in *ateapipb.ResumeActorRequest,
-				opts ...grpc.CallOption,
-			) (*ateapipb.ResumeActorResponse, error) {
+			resumeFn: func(context.Context, *ateapi.ResumeActorRequest, ...grpc.CallOption) (*ateapi.ResumeActorResponse, error) {
 				resumeCalls.Add(1)
-				return nil, status.Error(codes.ResourceExhausted, "no free workers available")
+				return nil, status.Error(codes.FailedPrecondition, desc)
 			},
 		}
 
-		h := New(clientMock, ParkedRequestConfig{Budget: 500 * time.Millisecond, Max: 1}, nil)
-		release, ok := h.parking.enter(context.Background())
+		parkMetrics, reader := newTestParkingMetrics(t)
+		h := New(clientMock, ParkedRequestConfig{Budget: 500 * time.Millisecond, Max: 1}, parkMetrics)
+		// With the only slot taken, a request that parked would be shed with
+		// "router at capacity" instead of the resume error.
+		release, ok := h.parking.enter(context.Background(), ateattr.RouterOutcomeUnavailable)
 		if !ok {
 			t.Fatal("priming enter should be admitted")
 		}
@@ -477,10 +812,21 @@ func TestHandleRequestHeaders_FullLotShedsParkedRequest(t *testing.T) {
 			&corev3.HeaderValue{Key: ":authority", Value: authority},
 		)
 
+		start := time.Now()
 		_, err := h.HandleRequestHeaders(context.Background(), md)
-		if err == nil {
-			t.Fatal("expected error when a parked request finds the lot full")
+
+		// Never parked: no wait, one attempt, the lot untouched.
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("request waited %v, want no parked wait", elapsed)
 		}
+		if got := resumeCalls.Load(); got != 1 {
+			t.Errorf("resume attempts = %d, want 1", got)
+		}
+		if got := rejectedByOutcome(t, reader); len(got) != 0 {
+			t.Errorf("parking.rejected = %v, want none", got)
+		}
+
+		// The caller gets the resume error, not the shed.
 		var reqErr *extproc.ReqError
 		if !errors.As(err, &reqErr) {
 			t.Fatalf("expected *extproc.ReqError, got %T (%v)", err, err)
@@ -488,18 +834,107 @@ func TestHandleRequestHeaders_FullLotShedsParkedRequest(t *testing.T) {
 		if reqErr.StatusCode != int(envoy_type.StatusCode_ServiceUnavailable) {
 			t.Errorf("status code = %d, want %d (503)", reqErr.StatusCode, envoy_type.StatusCode_ServiceUnavailable)
 		}
-		if !strings.Contains(reqErr.Error(), "router at capacity") {
-			t.Errorf("error body = %q, want it to mention capacity", reqErr.Error())
+		if want := "actor team-a/" + testUUID + " unavailable: " + desc; reqErr.Error() != want {
+			t.Errorf("error body = %q, want %q", reqErr.Error(), want)
 		}
-		// Shedding happens at the park transition: exactly one attempt has run
-		// when the caller is turned away.
-		if got := resumeCalls.Load(); got != 1 {
-			t.Errorf("expected the caller shed after exactly 1 attempt, got %d", got)
-		}
-
-		// The abandoned flight retries on until its budget, like any flight
-		// whose callers left; sleep (fake time) past the budget so it exits
-		// before the bubble does.
-		time.Sleep(600 * time.Millisecond)
 	})
+}
+
+// TestHandleRequestHeaders_FullLotShedsParkedRequest verifies the other half
+// of lot admission: when the lot is full, a request whose resume actually
+// parks (first retryable failure) is shed with 503 "router at capacity" — at
+// the park transition, after its single initial attempt, not before any.
+//
+// The shed keeps a ResourceExhausted retry failure as its cause, so the route
+// metric reports no_capacity. It drops any other retry failure, so the route
+// metric reports unavailable. parking.rejected carries the same outcome.
+func TestHandleRequestHeaders_FullLotShedsParkedRequest(t *testing.T) {
+	tests := []struct {
+		name        string
+		resumeErr   error
+		wantCode    codes.Code
+		wantOutcome string
+	}{
+		{
+			name:        "ResourceExhausted is kept as the cause",
+			resumeErr:   status.Error(codes.ResourceExhausted, "no worker has room for the actor"),
+			wantCode:    codes.ResourceExhausted,
+			wantOutcome: ateattr.RouterOutcomeNoCapacity,
+		},
+		{
+			name:        "Aborted is dropped",
+			resumeErr:   status.Error(codes.Aborted, "another operation is in progress"),
+			wantCode:    codes.Unknown,
+			wantOutcome: ateattr.RouterOutcomeUnavailable,
+		},
+		{
+			name:        "Unavailable is dropped",
+			resumeErr:   status.Error(codes.Unavailable, "ateapi restarting"),
+			wantCode:    codes.Unknown,
+			wantOutcome: ateattr.RouterOutcomeUnavailable,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const testUUID = "123e4567-e89b-12d3-a456-426614174000"
+				authority := testUUID + ".team-a.actors.resources.substrate.ate.dev"
+
+				var resumeCalls atomic.Int32
+				clientMock := &mockClient{
+					resumeFn: func(
+						ctx context.Context,
+						in *ateapi.ResumeActorRequest,
+						opts ...grpc.CallOption,
+					) (*ateapi.ResumeActorResponse, error) {
+						resumeCalls.Add(1)
+						return nil, tc.resumeErr
+					},
+				}
+
+				parkMetrics, reader := newTestParkingMetrics(t)
+				h := New(clientMock, ParkedRequestConfig{Budget: 500 * time.Millisecond, Max: 1}, parkMetrics)
+				release, ok := h.parking.enter(context.Background(), ateattr.RouterOutcomeUnavailable)
+				if !ok {
+					t.Fatal("priming enter should be admitted")
+				}
+				defer release(parkOutcomeServed)
+
+				md := requestMetadata(testUUID, "team-a",
+					&corev3.HeaderValue{Key: ":authority", Value: authority},
+				)
+
+				_, err := h.HandleRequestHeaders(context.Background(), md)
+				if err == nil {
+					t.Fatal("expected error when a parked request finds the lot full")
+				}
+				var reqErr *extproc.ReqError
+				if !errors.As(err, &reqErr) {
+					t.Fatalf("expected *extproc.ReqError, got %T (%v)", err, err)
+				}
+				if reqErr.StatusCode != int(envoy_type.StatusCode_ServiceUnavailable) {
+					t.Errorf("status code = %d, want %d (503)", reqErr.StatusCode, envoy_type.StatusCode_ServiceUnavailable)
+				}
+				if !strings.Contains(reqErr.Error(), "router at capacity") {
+					t.Errorf("error body = %q, want it to mention capacity", reqErr.Error())
+				}
+				if got := status.Code(err); got != tc.wantCode {
+					t.Errorf("status.Code(err) = %v, want %v", got, tc.wantCode)
+				}
+				if got := rejectedByOutcome(t, reader); len(got) != 1 || got[tc.wantOutcome] != 1 {
+					t.Errorf("parking.rejected by outcome = %v, want {%s: 1}", got, tc.wantOutcome)
+				}
+				// Shedding happens at the park transition: exactly one attempt has run
+				// when the caller is turned away.
+				if got := resumeCalls.Load(); got != 1 {
+					t.Errorf("expected the caller shed after exactly 1 attempt, got %d", got)
+				}
+
+				// The abandoned flight retries on until its budget, like any flight
+				// whose callers left; sleep (fake time) past the budget so it exits
+				// before the bubble does.
+				time.Sleep(600 * time.Millisecond)
+			})
+		})
+	}
 }

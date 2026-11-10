@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -72,7 +72,7 @@ func sdsmintCAPoolPath(t *testing.T, pod *corev1.PodSpec) string {
 
 func egressPodSpec(t *testing.T) *corev1.PodSpec {
 	t.Helper()
-	const egressManifestPath = "../../../../manifests/ate-install/atenet-egress-with-sdsmint.yaml"
+	const egressManifestPath = "../../../../manifests/ate-install/atenet-egress.yaml"
 	raw, err := os.ReadFile(egressManifestPath)
 	if err != nil {
 		t.Fatalf("reading %s: %v", egressManifestPath, err)

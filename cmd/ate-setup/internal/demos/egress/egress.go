@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,12 +14,17 @@
 
 // Package egress installs the egress demo, which exercises egress policy
 // enforcement through atenet.
+//
+// Its actors project the egress gateway trust bundle. A golden snapshot only
+// exists once an actor starts, and an actor whose trust bundle does not
+// resolve never does, so a timeout waiting for the golden is the symptom of a
+// missing egress gateway CA.
 package egress
 
 import (
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/demos"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/steps"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/demos"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 // namespace is the pool's k8s namespace; it doubles as the atespace holding

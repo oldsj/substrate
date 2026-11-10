@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,59 +21,63 @@ package defaults
 import (
 	"fmt"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/protobuf/proto"
 )
 
 // Apply set default values to Substrate resource proto messages.
 func Apply(m proto.Message) {
 	switch v := m.(type) {
-	case *ateapipb.Actor:
+	case *ateapi.AccessPolicy:
+		applyAccessPolicyDefaults(v)
+	case *ateapi.Actor:
 		applyActorDefaults(v)
-	case *ateapipb.ActorTemplate:
+	case *ateapi.ActorTemplate:
 		applyActorTemplateDefaults(v)
-	case *ateapipb.Atespace:
+	case *ateapi.Atespace:
 		applyAtespaceDefaults(v)
-	case *ateapipb.EgressPolicy:
+	case *ateapi.EgressPolicy:
 		applyEgressPolicyDefaults(v)
-	case *ateapipb.Tag:
+	case *ateapi.Tag:
 		applyTagDefaults(v)
-	case *ateapipb.Worker:
+	case *ateapi.Worker:
 		applyWorkerDefaults(v)
 	default:
 		panic(fmt.Sprintf("unknown resource message %T", m))
 	}
 }
 
-func applyActorTemplateDefaults(t *ateapipb.ActorTemplate) {
+func applyActorTemplateDefaults(t *ateapi.ActorTemplate) {
 	if t == nil {
 		return
 	}
+	// snapshot_config is optional; an omitted one takes every default.
+	if t.SnapshotConfig == nil {
+		t.SnapshotConfig = &ateapi.SnapshotConfig{}
+	}
 	applySnapshotConfigDefaults(t.SnapshotConfig)
+	applyEgressRuleDefaults(t.GetGoldenEgressPolicy().GetRules())
 	for _, c := range t.Containers {
 		applyContainerDefaults(c)
 	}
 }
 
-func applySnapshotConfigDefaults(sc *ateapipb.SnapshotConfig) {
+func applySnapshotConfigDefaults(sc *ateapi.SnapshotConfig) {
 	if sc == nil {
 		return
 	}
-	if sc.OnPause == ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED {
-		sc.OnPause = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
+	if sc.PreferredFidelity == ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED {
+		sc.PreferredFidelity = ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
 	}
-	if sc.OnCommit == ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_UNSPECIFIED {
-		sc.OnCommit = ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
+	if sc.GoldenSnapshotConfig == nil {
+		sc.GoldenSnapshotConfig = &ateapi.GoldenSnapshotConfig{}
 	}
-	if sc.OnResume == nil {
-		sc.OnResume = &ateapipb.OnResumeConfig{}
-	}
-	if sc.OnResume.FromData == ateapipb.ResumeSource_RESUME_SOURCE_UNSPECIFIED {
-		sc.OnResume.FromData = ateapipb.ResumeSource_RESUME_SOURCE_COLD_BOOT
+	if sc.GoldenSnapshotConfig.Mode == ateapi.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_UNSPECIFIED {
+		sc.GoldenSnapshotConfig.Mode = ateapi.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_ENABLED
 	}
 }
 
-func applyContainerDefaults(c *ateapipb.Container) {
+func applyContainerDefaults(c *ateapi.Container) {
 	const (
 		defaultWakeupProbeTimeoutSeconds int32 = 30
 		defaultWakeupProbePath                 = "/"
@@ -89,12 +93,30 @@ func applyContainerDefaults(c *ateapipb.Container) {
 	}
 }
 
-func applyActorDefaults(*ateapipb.Actor) {}
+func applyAccessPolicyDefaults(*ateapi.AccessPolicy) {}
 
-func applyAtespaceDefaults(*ateapipb.Atespace) {}
+func applyActorDefaults(*ateapi.Actor) {}
 
-func applyEgressPolicyDefaults(*ateapipb.EgressPolicy) {}
+func applyAtespaceDefaults(*ateapi.Atespace) {}
 
-func applyTagDefaults(*ateapipb.Tag) {}
+func applyEgressPolicyDefaults(p *ateapi.EgressPolicy) {
+	applyEgressRuleDefaults(p.GetRules())
+}
 
-func applyWorkerDefaults(*ateapipb.Worker) {}
+// applyEgressRuleDefaults fills the port of an http or https rule that
+// names none: the protocol's well-known port. A tls_passthrough rule has no
+// default; validation requires its ports.
+func applyEgressRuleDefaults(rules []*ateapi.EgressRule) {
+	for _, r := range rules {
+		switch {
+		case r.GetHttp() != nil && r.Http.Ports == nil:
+			r.Http.Ports = &ateapi.Ports{Numbers: []int32{80}}
+		case r.GetHttps() != nil && r.Https.Ports == nil:
+			r.Https.Ports = &ateapi.Ports{Numbers: []int32{443}}
+		}
+	}
+}
+
+func applyTagDefaults(*ateapi.Tag) {}
+
+func applyWorkerDefaults(*ateapi.Worker) {}

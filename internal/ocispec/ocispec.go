@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,45 +13,39 @@
 // limitations under the License.
 
 // Package ocispec builds the runtime-neutral OCI spec for actor bundles, which
-// each ateom shapes for its runtime.
+// each worker shapes for its runtime.
 package ocispec
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
+	"slices"
 
-	"github.com/agent-substrate/substrate/internal/ateompath"
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"go.ate.dev/substrate/internal/imagecache"
+	"go.ate.dev/substrate/internal/nodepath"
+	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 )
 
 // specFile is the OCI spec file name within a bundle.
 const specFile = "config.json"
 
-// hostname is the UTS hostname for actor containers.
-const hostname = "actor"
+// Hostname is the UTS hostname for actor containers.
+const Hostname = "actor"
 
-// Options describes one actor container. Args, Env, UID/GID, Cwd and
-// Capabilities arrive already resolved.
+// Options describes one actor container.
 type Options struct {
-	ActorUID      string
-	ContainerName string
-	Args          []string
-	Env           []string
-	// UID and GID are the process identity; zero is root.
-	UID uint32
-	GID uint32
-	// Cwd is the process working directory; empty means "/".
-	Cwd string
-	// NetNSPath is the network namespace the ateom runs the actor in.
-	NetNSPath    string
-	Volumes      []*ateletpb.Volume
-	VolumeMounts []*ateletpb.VolumeMount
-	Capabilities []string
-	// Resources are the container's own declared limits, or nil for none.
-	Resources *ateletpb.ResourceLimits
+	// ActorUID names the actor's network namespace.
+	ActorUID string
+	// ActorDirs are the actor's directories the bind mount sources are joined
+	// from, one subdirectory per volume name.
+	ActorDirs *ateworkerpb.ActorDirs
+	// Container carries the process and its volume mounts.
+	Container *ateworkerpb.Container
 }
 
 const (
@@ -68,15 +62,16 @@ const (
 // ociResources maps the resolved limits onto the OCI spec's linux.resources.
 // Returns nil when nothing is set, so the spec carries no linux.resources at
 // all for a container that declares no limits.
-func ociResources(r *ateletpb.ResourceLimits) *specs.LinuxResources {
-	if r == nil || (r.GetMemoryBytes() <= 0 && r.GetCpuMillis() <= 0) {
+func ociResources(r *ateworkerpb.ResourceRequirements) *specs.LinuxResources {
+	l := r.GetLimits()
+	if l.GetMemoryBytes() <= 0 && l.GetCpuMillicores() <= 0 {
 		return nil
 	}
 	out := &specs.LinuxResources{}
-	if b := r.GetMemoryBytes(); b > 0 {
+	if b := l.GetMemoryBytes(); b > 0 {
 		out.Memory = &specs.LinuxMemory{Limit: &b}
 	}
-	if m := r.GetCpuMillis(); m > 0 {
+	if m := l.GetCpuMillicores(); m > 0 {
 		quota := max(m*cpuQuotaPeriodUS/1000, cpuQuotaMinUS)
 		period := uint64(cpuQuotaPeriodUS)
 		out.CPU = &specs.LinuxCPU{Quota: &quota, Period: &period}
@@ -84,25 +79,61 @@ func ociResources(r *ateletpb.ResourceLimits) *specs.LinuxResources {
 	return out
 }
 
+// BuildSandbox returns the OCI spec of a sandbox with no root container: the
+// hostname and namespaces, and no process, rootfs, or mounts.
+func BuildSandbox(actorUID string) *specs.Spec {
+	return &specs.Spec{
+		Hostname: Hostname,
+		Linux:    &specs.Linux{Namespaces: namespaces(actorUID)},
+	}
+}
+
+// namespaces returns the namespaces of an actor's sandbox and containers. The
+// network namespace is the actor's.
+func namespaces(actorUID string) []specs.LinuxNamespace {
+	return []specs.LinuxNamespace{
+		{Type: "pid"},
+		{Type: "network", Path: nodepath.ActorNetNSPath(actorUID)},
+		{Type: "ipc"},
+		{Type: "uts"},
+		{Type: "mount"},
+	}
+}
+
+// processUser maps the resolved identity onto the OCI process. nil is root.
+func processUser(u *ateworkerpb.ProcessUser) specs.User {
+	return specs.User{UID: u.GetUid(), GID: u.GetGid(), AdditionalGids: u.GetAdditionalGids()}
+}
+
+// systemMounts returns the system mounts of an actor container. ShapeGVisor
+// removes the parts runsc does not use. Like containerd's CRI plugin, it has no
+// /run mount, so the image's /run shows through.
+func systemMounts() []specs.Mount {
+	return []specs.Mount{
+		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
+		{Destination: "/dev/mqueue", Type: "mqueue", Source: "mqueue", Options: []string{"nosuid", "noexec", "nodev"}},
+		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+		{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777"}},
+	}
+}
+
 // Build returns a runtime-neutral OCI spec for an actor container.
 func Build(o Options) *specs.Spec {
-	cwd := o.Cwd
-	if cwd == "" {
-		cwd = "/"
-	}
+	container := o.Container
+	containerSpec := container.GetContainerSpec()
 	spec := &specs.Spec{
 		Process: &specs.Process{
-			User: specs.User{
-				UID: o.UID,
-				GID: o.GID,
-			},
-			Args: o.Args,
-			Env:  o.Env,
-			Cwd:  cwd,
+			User: processUser(containerSpec.GetUser()),
+			Args: containerSpec.GetArgs(),
+			Env:  containerSpec.GetEnv(),
+			Cwd:  cmp.Or(containerSpec.GetCwd(), "/"),
 			Capabilities: &specs.LinuxCapabilities{
-				Bounding:  o.Capabilities,
-				Effective: o.Capabilities,
-				Permitted: o.Capabilities,
+				Bounding:  containerSpec.GetCapabilities(),
+				Effective: containerSpec.GetCapabilities(),
+				Permitted: containerSpec.GetCapabilities(),
 				// Inheritable and Ambient stay empty; capabilities inherit via
 				// Bounding.
 				//
@@ -111,8 +142,10 @@ func Build(o Options) *specs.Spec {
 			Rlimits: []specs.POSIXRlimit{
 				{
 					Type: "RLIMIT_NOFILE",
-					Hard: 1024,
-					Soft: 1024,
+					// NOTE: raised from 1024 because proxy-heavy actors ran out
+					// of sockets; 1048576 is the kernel's default fs.nr_open.
+					Hard: 1048576,
+					Soft: 1048576,
 				},
 			},
 		},
@@ -120,97 +153,47 @@ func Build(o Options) *specs.Spec {
 			Path:     "rootfs",
 			Readonly: false,
 		},
-		Hostname: hostname,
-		Mounts: []specs.Mount{
-			{
-				Destination: "/proc",
-				Type:        "proc",
-				Source:      "proc",
-			},
-			{
-				Destination: "/dev",
-				Type:        "tmpfs",
-				Source:      "tmpfs",
-			},
-			{
-				Destination: "/sys",
-				Type:        "sysfs",
-				Source:      "sysfs",
-				Options: []string{
-					"nosuid",
-					"noexec",
-					"nodev",
-					"ro",
-				},
-			},
-		},
+		Hostname: Hostname,
+		Mounts:   systemMounts(),
 		Linux: &specs.Linux{
-			Namespaces: []specs.LinuxNamespace{
-				{
-					Type: "pid",
-				},
-				{
-					Type: "network",
-					Path: o.NetNSPath, // Will be created by ateom
-				},
-				{
-					Type: "ipc",
-				},
-				{
-					Type: "uts",
-				},
-				{
-					Type: "mount",
-				},
-			},
-			Resources: ociResources(o.Resources),
+			Namespaces: namespaces(o.ActorUID),
+			Resources:  ociResources(containerSpec.GetResources()),
 		},
 	}
 
-	volumesByName := make(map[string]*ateletpb.Volume, len(o.Volumes))
-	for _, vol := range o.Volumes {
-		volumesByName[vol.GetName()] = vol
-	}
-	for _, vm := range o.VolumeMounts {
-		var srcPath string
-		options := []string{"bind", "rw"}
-		switch volumesByName[vm.GetName()].GetSource().(type) {
-		case *ateletpb.Volume_DurableDir:
-			srcPath = ateompath.DurableDirVolumeMountPoint(o.ActorUID, vm.GetName())
-		case *ateletpb.Volume_External:
-			srcPath = ateompath.VolumeHostPath(o.ActorUID, vm.GetName())
-		case *ateletpb.Volume_SystemInfo:
-			srcPath = ateompath.SystemInfoVolumeRoot(o.ActorUID, vm.GetName())
-			options = []string{"bind", "ro"}
-		case *ateletpb.Volume_Image:
-			srcPath = ateompath.ImageVolumeMountPath(o.ActorUID, o.ContainerName, vm.GetName())
-			options = []string{"bind", "ro"}
-		default:
-			continue
-		}
-		spec.Mounts = append(spec.Mounts, specs.Mount{
-			Destination: vm.GetMountPath(),
+	// Mount order across volume kinds does not matter: the API rejects mounts
+	// that nest under one another. A volume at a system mount path, such as
+	// /tmp, replaces that mount in place.
+	// nodev: the runtime must not honor a device node on a volume.
+	bind := func(dest, src, mode string) {
+		m := specs.Mount{
+			Destination: dest,
 			Type:        "bind",
-			Source:      srcPath,
-			Options:     options,
-		})
+			Source:      src,
+			Options:     []string{"bind", mode, "nodev"},
+		}
+		if i := slices.IndexFunc(spec.Mounts, func(s specs.Mount) bool { return s.Destination == dest }); i >= 0 {
+			spec.Mounts[i] = m
+			return
+		}
+		spec.Mounts = append(spec.Mounts, m)
+	}
+	actorDirs := o.ActorDirs
+	for _, m := range container.GetDurableDirVolumeMounts() {
+		bind(m.GetMountPath(), filepath.Join(actorDirs.GetDurableDirVolumeMountsDir(), m.GetName()), "rw")
+	}
+	for _, m := range container.GetExternalVolumeMounts() {
+		bind(m.GetMountPath(), filepath.Join(actorDirs.GetExternalVolumeMountsDir(), m.GetName()), "rw")
+	}
+	for _, m := range container.GetSystemInfoVolumeMounts() {
+		bind(m.GetMountPath(), filepath.Join(actorDirs.GetSystemInfoVolumeRootsDir(), m.GetName()), "ro")
+	}
+	bundlePath := filepath.Join(actorDirs.GetOciBundleDir(), container.GetName())
+	for _, m := range container.GetImageVolumeMounts() {
+		bind(m.GetMountPath(), imagecache.ImageVolumeMountPath(bundlePath, m.GetName()), "ro")
 	}
 
 	return spec
-}
-
-// Load reads the OCI spec of the bundle at bundlePath.
-func Load(bundlePath string) (*specs.Spec, error) {
-	specPath := path.Join(bundlePath, specFile)
-	b, err := os.ReadFile(specPath)
-	if err != nil {
-		return nil, fmt.Errorf("reading %q: %w", specPath, err)
-	}
-	var spec specs.Spec
-	if err := json.Unmarshal(b, &spec); err != nil {
-		return nil, fmt.Errorf("parsing %q: %w", specPath, err)
-	}
-	return &spec, nil
 }
 
 // Save writes spec as the OCI spec of the bundle at bundlePath.

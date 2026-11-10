@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,30 +17,74 @@ package steps
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/images"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/log"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/images"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/kustomize"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
 )
 
 const (
 	// installDir is the manifest root, relative to the repository root.
 	installDir = "manifests/ate-install"
-	// Envoy dataplane image name
-	envoyDataplaneImage = "envoy-dataplane"
-	// Envoy dataplane Dockerfile path
-	envoyDataplaneDockefile = "cmd/dataplane/envoy"
 )
 
-// SystemOverlay picks the manifest source for a full control plane install.
+// cordonSystemInfraComponent is the kustomize component that pins each
+// system infra workload to its own node pool, layered over every system
+// infra apply under --cordon-system-infra-components.
+const cordonSystemInfraComponent = installDir + "/components/cordon-system-infra-components"
+
+// e2eComponent is the kustomize component that tunes the control plane and
+// data plane for end-to-end test runs, layered over every control plane apply
+// under --e2e-tuning.
+const e2eComponent = installDir + "/components/e2e"
+
+// fakeDataPlaneComponent is the kustomize component that puts fake-atelet in
+// atelet's DaemonSet and fake-workersync in place of ate-controller, layered
+// over the atelet and ate-controller applies under --fake-data-plane.
+const fakeDataPlaneComponent = installDir + "/components/fake-data-plane"
+
+const agentgatewayStaticMTLSComponent = installDir + "/components/agentgateway-static-mtls"
+
+// components lists the kustomize components every control plane apply is
+// composed with. Each patch targets its workloads by name, and kustomize leaves
+// a stream alone when nothing in it matches, so composing a manifest that
+// carries none of them is harmless.
+func (e *Env) components() []string {
+	var components []string
+	// e2e must come before fake-data-plane: e2e appends to atelet's args,
+	// and fake-data-plane removes args entirely.
+	if e.Cfg.E2ETuning {
+		components = append(components, e.Cfg.Path(e2eComponent))
+	}
+	if e.Cfg.FakeDataPlane {
+		components = append(components, e.Cfg.Path(fakeDataPlaneComponent))
+	}
+	if e.Cfg.Router == config.RouterAgentgateway {
+		components = append(components, e.Cfg.Path(agentgatewayStaticMTLSComponent))
+	}
+	if e.Cfg.CordonSystemInfraComponents {
+		components = append(components, e.Cfg.Path(cordonSystemInfraComponent))
+	}
+	return components
+}
+
+// SystemOverlay picks the kustomization for a full control plane install.
 //
-// The choice is a product of two switches: kind vs GKE, and the atenet router dataplane.
-// An empty return means "no overlay": apply the base manifests/ate-install
-// directory directly, which is what a plain GKE envoy install does.
+// The choice is a product of two switches: kind vs GKE, and the atenet router
+// dataplane. The plain GKE envoy install renders the base kustomization rather
+// than the raw manifests/ate-install directory: the directory would also
+// re-apply pod-certificate-controller.yaml (reverting the size10 flags and the
+// WORKERS_PER_SIGNER value set earlier in the install), both atenet-egress
+// variants, and the sandboxconfig files, all of which have their own apply
+// steps.
 func SystemOverlay(cfg *config.Config) string {
 	switch {
 	case cfg.Router == config.RouterAgentgateway && cfg.Kind:
@@ -50,61 +94,174 @@ func SystemOverlay(cfg *config.Config) string {
 	case cfg.Kind:
 		return installDir + "/kind"
 	default:
-		return ""
+		return installDir + "/base"
 	}
+}
+
+// kustomization directory, before image resolution. It composes path with the
+// selected components (see components), so the same patches reach every
+// control plane workload whichever apply path delivers it.
+func (e *Env) render(path string) ([]byte, error) {
+	if components := e.components(); len(components) > 0 {
+		return kustomize.Compose(path, components...)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("while reading %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return kustomize.Build(path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("while reading %s: %w", path, err)
+	}
+	return data, nil
+}
+
+// renderBytes is render for a manifest already held in memory.
+func (e *Env) renderBytes(manifest []byte) ([]byte, error) {
+	if components := e.components(); len(components) > 0 {
+		return kustomize.ComposeBytes(manifest, components...)
+	}
+	return manifest, nil
+}
+
+// renderResolve renders path and resolves its image references.
+func (e *Env) renderResolve(ctx context.Context, path string) ([]byte, error) {
+	manifest, err := e.render(path)
+	if err != nil {
+		return nil, err
+	}
+	return e.ResolveManifestBytes(ctx, manifest)
+}
+
+// renderResolveApply renders path, resolves its images, and applies the result.
+func (e *Env) renderResolveApply(ctx context.Context, path string) error {
+	manifest, err := e.renderResolve(ctx, path)
+	if err != nil {
+		return err
+	}
+	return e.Kube.ApplyBytes(ctx, manifest)
 }
 
 // renderSystemManifests produces the full control plane manifest with all
 // image references resolved.
 func (e *Env) renderSystemManifests(ctx context.Context) ([]byte, error) {
-	if overlay := SystemOverlay(e.Cfg); overlay != "" {
-		return e.KustomizeResolve(ctx, overlay)
+	manifest, err := e.render(e.Cfg.Path(SystemOverlay(e.Cfg)))
+	if err != nil {
+		return nil, err
 	}
-	return e.ResolveManifest(ctx, e.Cfg.Manifest())
+	if manifest, err = setIDPServerIssuer(manifest, e.Cfg.ActorJWTIssuer); err != nil {
+		return nil, err
+	}
+	if manifest, err = e.setAgentgatewayIngressAllowedSPIFFEIDs(manifest); err != nil {
+		return nil, err
+	}
+	if e.Cfg.Router != config.RouterAgentgateway {
+		manifest, err = e.patchAtenetRouterAllowedSPIFFEIDs(manifest)
+		if err != nil {
+			return nil, err
+		}
+		imageReference, err := e.dockerfileImage(ctx, images.EnvoyDataplane)
+		if err != nil {
+			return nil, err
+		}
+		manifest = e.patchEnvoyDataplaneImage(manifest, imageReference)
+	}
+	return e.ResolveManifestBytes(ctx, manifest)
 }
 
 // renderAtenetRouterManifest produces the atenet router manifest for the
 // selected dataplane.
 func (e *Env) renderAtenetRouterManifest(ctx context.Context) ([]byte, error) {
 	if e.Cfg.Router == config.RouterAgentgateway {
-		return e.KustomizeResolve(ctx, installDir+"/agentgateway-router")
+		manifest, err := e.render(e.Cfg.Path(installDir + "/agentgateway-router"))
+		if err != nil {
+			return nil, err
+		}
+		manifest, err = e.setAgentgatewayIngressAllowedSPIFFEIDs(manifest)
+		if err != nil {
+			return nil, err
+		}
+		return e.ResolveManifestBytes(ctx, manifest)
 	}
-	return e.ResolveManifest(ctx, e.Cfg.Manifest("atenet-router.yaml"))
+	manifest, err := e.render(e.Cfg.Manifest("atenet-router.yaml"))
+	if err != nil {
+		return nil, err
+	}
+	manifest, err = e.patchAtenetRouterAllowedSPIFFEIDs(manifest)
+	if err != nil {
+		return nil, err
+	}
+	imageReference, err := e.dockerfileImage(ctx, images.EnvoyDataplane)
+	if err != nil {
+		return nil, err
+	}
+	manifest = e.patchEnvoyDataplaneImage(manifest, imageReference)
+	return e.ResolveManifestBytes(ctx, manifest)
 }
 
-// atenetEgressManifestPath returns the egress manifest path based on configuration.
-func (e *Env) atenetEgressManifestPath() string {
-	if e.Cfg.ExperimentalUseSDSMint {
-		return e.Cfg.Manifest("atenet-egress-with-sdsmint.yaml")
+func (e *Env) setAgentgatewayIngressAllowedSPIFFEIDs(raw []byte) ([]byte, error) {
+	if e.Cfg.Router != config.RouterAgentgateway {
+		return raw, nil
 	}
+	// nil would marshal as null, which agentgateway's networkAuthorization CEL rule can't evaluate.
+	allowed := e.Cfg.IngressAllowedSPIFFEIDs
+	if allowed == nil {
+		allowed = []string{}
+	}
+	ids, err := json.Marshal(allowed)
+	if err != nil {
+		return nil, fmt.Errorf("encoding AgentGateway ingress SPIFFE IDs: %w", err)
+	}
+	marker := []byte("[ATE_INGRESS_ALLOWED_SPIFFE_IDS]")
+	if count := bytes.Count(raw, marker); count != 1 {
+		return nil, fmt.Errorf("expected 1 AgentGateway ingress SPIFFE IDs placeholder, found %d", count)
+	}
+	return bytes.Replace(raw, marker, ids, 1), nil
+}
+
+// atenetEgressManifestPath returns the envoy egress gateway manifest.
+func (e *Env) atenetEgressManifestPath() string {
 	return e.Cfg.Manifest("atenet-egress.yaml")
 }
 
 // renderAtenetEgressManifest produces the atenet egress manifest.
-func (e *Env) renderAtenetEgressManifest(ctx context.Context) ([]byte, error) {
+func (e *Env) renderAtenetEgressManifest(ctx context.Context, providers []config.CredentialProvider) ([]byte, error) {
 	general := e.Cfg.AdditionalEgressExtprocService != ""
-	injection := e.Cfg.ExperimentalEgressCredentialInjection
 
 	if e.Cfg.Router == config.RouterAgentgateway {
+		// Rejected during configuration loading, which names the channel the
+		// value came from. This guards the invariant for a caller that built
+		// a Config directly; an operator never sees it.
 		if general {
-			return nil, fmt.Errorf("--experimental-additional-egress-extproc-service requires --atenet-dataplane=envoy")
+			return nil, fmt.Errorf("internal: additional ext_proc filter reached rendering with dataplane %s", config.RouterAgentgateway)
 		}
-		if injection {
-			return nil, fmt.Errorf("--experimental-egress-credential-injection requires --atenet-dataplane=envoy")
+		raw, err := e.render(e.Cfg.Path(installDir + "/agentgateway-egress"))
+		if err != nil {
+			return nil, err
 		}
-		if e.Cfg.ExperimentalUseSDSMint {
-			return e.KustomizeResolve(ctx, installDir+"/agentgateway-egress-mitm")
+		raw, err = e.setAgentgatewayIngressAllowedSPIFFEIDs(raw)
+		if err != nil {
+			return nil, err
 		}
-		return e.KustomizeResolve(ctx, installDir+"/agentgateway-egress")
+		raw, err = patchAgentgatewayEgressInject(raw, providers)
+		if err != nil {
+			return nil, err
+		}
+		return e.ResolveManifestBytes(ctx, raw)
 	}
 
-	imageReference, err := images.BuildDockerfileImage(ctx, e.Cfg.Root, e.Cfg.KODockerRepo, envoyDataplaneImage, e.Cfg.Path(envoyDataplaneDockefile))
+	imageReference, err := e.dockerfileImage(ctx, images.EnvoyDataplane)
 	if err != nil {
 		return nil, err
 	}
 
 	// The general additional-ext_proc filter and egress credential injection are
-	// independent splices with their own markers, so compose them.
+	// independent splices with their own markers, so compose them. The cordon
+	// render comes last, over the spliced stream, so the node pinning reaches
+	// every variant.
 	var raw []byte
 	if general {
 		raw, err = e.patchAtenetEgressManifest()
@@ -114,14 +271,83 @@ func (e *Env) renderAtenetEgressManifest(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if injection {
-		raw, err = e.patchAtenetEgressInject(raw)
+	raw, err = e.patchAtenetEgressInject(raw, providers)
+	if err != nil {
+		return nil, err
+	}
+	raw = e.patchEnvoyDataplaneImage(raw, imageReference)
+	if e.Cfg.EnvoyConcurrency > 0 {
+		raw, err = patchAtenetEgressEnvoyConcurrency(raw, e.Cfg.EnvoyConcurrency)
 		if err != nil {
 			return nil, err
 		}
 	}
-	raw = e.patchEnvoyDataplaneImage(raw, imageReference)
-	return e.ResolveManifestBytes(ctx, raw)
+	rendered, err := e.renderBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	return e.ResolveManifestBytes(ctx, rendered)
+}
+
+// patchAtenetEgressEnvoyConcurrency appends --concurrency <concurrency> to the
+// envoy container's args in the atenet-egress Deployment.
+func patchAtenetEgressEnvoyConcurrency(raw []byte, concurrency int) ([]byte, error) {
+	return appendContainerArgs(raw, "atenet-egress", "envoy", "--concurrency", strconv.Itoa(concurrency))
+}
+
+// patchAtenetRouterAllowedSPIFFEIDs appends --ingress-allowed-spiffe-ids to the
+// atenet-router container's args in the Envoy router Deployment. The base
+// manifest carries no allowlist, because which clients may reach actors is the
+// install's to decide. Without one the router serves no traffic.
+func (e *Env) patchAtenetRouterAllowedSPIFFEIDs(raw []byte) ([]byte, error) {
+	if len(e.Cfg.IngressAllowedSPIFFEIDs) == 0 {
+		return raw, nil
+	}
+	return appendContainerArgs(raw, "atenet-router", "atenet-router",
+		"--ingress-allowed-spiffe-ids="+strings.Join(e.Cfg.IngressAllowedSPIFFEIDs, ","))
+}
+
+// appendContainerArgs uses a kustomize JSON6902 patch to append args to the
+// first container of the named Deployment in ate-system. The patch first
+// tests that the first container is the one named, so a reordered manifest
+// fails the render instead of patching the wrong container.
+func appendContainerArgs(raw []byte, deployment, container string, args ...string) ([]byte, error) {
+	dir, err := os.MkdirTemp("", "ate-setup-kustomize-")
+	if err != nil {
+		return nil, fmt.Errorf("while creating a scratch kustomization: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	if err := os.WriteFile(filepath.Join(dir, "manifest.yaml"), raw, 0o600); err != nil {
+		return nil, fmt.Errorf("while staging a manifest for kustomize: %w", err)
+	}
+	var kustomization strings.Builder
+	fmt.Fprintf(&kustomization, `apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - manifest.yaml
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: %s
+      namespace: ate-system
+    patch: |-
+      - op: test
+        path: /spec/template/spec/containers/0/name
+        value: %q
+`, deployment, container)
+	for _, arg := range args {
+		fmt.Fprintf(&kustomization, `      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: %q
+`, arg)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "kustomization.yaml"), []byte(kustomization.String()), 0o600); err != nil {
+		return nil, fmt.Errorf("while writing a scratch kustomization: %w", err)
+	}
+	return kustomize.Build(dir)
 }
 
 // patchEnvoyDataplaneImage replaces the ${ENVOY_DATAPLANE_IMAGE} placeholder in
@@ -130,66 +356,76 @@ func (e *Env) patchEnvoyDataplaneImage(raw []byte, imageRef string) []byte {
 	return bytes.ReplaceAll(raw, []byte("${ENVOY_DATAPLANE_IMAGE}"), []byte(imageRef))
 }
 
-// patchAtenetEgressInject splices the credential-provider flags into the egress
-// sidecar over the #ATE_EGRESS_INJECT_FLAGS marker. It takes the manifest bytes
-// rather than reading the file so it can run after the general patch. Mirrors
-// hack/experimental-egress-credential-injection.sh; the two must stay in sync.
-func (e *Env) patchAtenetEgressInject(raw []byte) ([]byte, error) {
-	if !e.Cfg.ExperimentalUseSDSMint {
-		return nil, fmt.Errorf("--experimental-egress-credential-injection requires --experimental-use-sdsmint")
+// patchAtenetEgressInject replaces the #ATE_EGRESS_INJECT_FLAGS marker in the
+// egress sidecar's args with the credential-provider flags, or removes it when
+// injection is off, which leaves the gateway with no provider. It takes the
+// manifest bytes so it can run after the general patch.
+func (e *Env) patchAtenetEgressInject(raw []byte, providers []config.CredentialProvider) ([]byte, error) {
+	var flagsBlock string
+	if len(providers) > 0 {
+		flagsBlock = emitEgressInjectFlags(providers)
 	}
+	return replaceManifestMarker(raw, "#ATE_EGRESS_INJECT_FLAGS", flagsBlock)
+}
 
-	name := e.Cfg.CredentialProviderName
-	if name == "" {
-		name = "ate-secret://k8s.io"
+// The HTTP and HTTPS listeners share the egress policy and its providers.
+func patchAgentgatewayEgressInject(raw []byte, providers []config.CredentialProvider) ([]byte, error) {
+	var block string
+	for i, p := range providers {
+		if i == 0 {
+			block = "credentialProviders:"
+		}
+		block += fmt.Sprintf(`
+- uriAuthority: %q
+  target:
+    host: %q
+    policies:
+      backendTLS:
+        hostname: %q
+        cert: /run/podidentity.podcert.ate.dev/credential-bundle.pem
+        key: /run/podidentity.podcert.ate.dev/credential-bundle.pem
+        root: /run/servicedns-ca/trust-bundle.pem`, p.Name, p.Address, p.ServerName())
 	}
-	address := e.Cfg.CredentialProviderAddress
-	if address == "" {
-		address = "k8s-credential-provider.ate-system.svc:50051"
-	}
-	serverName := address
-	if i := strings.LastIndex(address, ":"); i >= 0 {
-		serverName = address[:i]
-	}
+	return replaceManifestMarker(raw, "#ATE_AGENTGATEWAY_CREDENTIAL_PROVIDERS", block)
+}
 
-	flagsBlock := emitEgressInjectFlags(name, address, serverName)
-
+func replaceManifestMarker(raw []byte, marker, block string) ([]byte, error) {
 	var out []string
-	flagsReplaced := 0
+	replaced := 0
 	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "#ATE_EGRESS_INJECT_FLAGS") {
+		if strings.HasPrefix(strings.TrimSpace(line), marker) {
 			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-			for _, l := range strings.Split(flagsBlock, "\n") {
-				if l == "" {
-					out = append(out, "")
-				} else {
+			if block != "" {
+				for _, l := range strings.Split(block, "\n") {
 					out = append(out, indent+l)
 				}
 			}
-			flagsReplaced++
+			replaced++
 			continue
 		}
 		out = append(out, line)
 	}
-	if flagsReplaced != 1 {
-		return nil, fmt.Errorf("expected 1 #ATE_EGRESS_INJECT_FLAGS marker in %s, found %d",
-			e.atenetEgressManifestPath(), flagsReplaced)
+	if replaced != 1 {
+		return nil, fmt.Errorf("expected 1 %s marker, found %d", marker, replaced)
 	}
 	return []byte(strings.Join(out, "\n")), nil
 }
 
-func emitEgressInjectFlags(name, address, serverName string) string {
-	return fmt.Sprintf(`- --credential-provider-name=%s
+// emitEgressInjectFlags writes the name, address and server name flags of each
+// provider in order, then the CA and client certificate every provider shares.
+func emitEgressInjectFlags(providers []config.CredentialProvider) string {
+	var flags string
+	for _, p := range providers {
+		flags += fmt.Sprintf(`- --credential-provider-name=%s
 - --credential-provider-address=%s
-- --credential-provider-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
-- --credential-provider-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem
-- --credential-provider-server-name=%s`, name, address, serverName)
+- --credential-provider-server-name=%s
+`, p.Name, p.Address, p.ServerName())
+	}
+	return flags + `- --credential-provider-ca-file=/run/servicedns.podcert.ate.dev/trust-bundle.pem
+- --credential-provider-client-cert=/run/podidentity.podcert.ate.dev/credential-bundle.pem`
 }
 
 func (e *Env) patchAtenetEgressManifest() ([]byte, error) {
-	if !e.Cfg.ExperimentalUseSDSMint {
-		return nil, fmt.Errorf("--experimental-additional-egress-extproc-service requires --experimental-use-sdsmint")
-	}
 	raw, err := os.ReadFile(e.atenetEgressManifestPath())
 	if err != nil {
 		return nil, fmt.Errorf("reading egress manifest: %w", err)
@@ -324,8 +560,8 @@ func emitAdditionalEgressExtprocCluster(address, port, serverName string) string
               port_value: %s`, additionalEgressExtprocCluster, serverName, serverName, additionalEgressExtprocCluster, address, port)
 }
 
-func (e *Env) applyAtenetEgress(ctx context.Context) error {
-	manifests, err := e.renderAtenetEgressManifest(ctx)
+func (e *Env) applyAtenetEgress(ctx context.Context, providers []config.CredentialProvider) error {
+	manifests, err := e.renderAtenetEgressManifest(ctx, providers)
 	if err != nil {
 		return err
 	}
@@ -339,7 +575,7 @@ func (e *Env) applyAtenetEgress(ctx context.Context) error {
 		return err
 	}
 
-	if running && (e.Cfg.AdditionalEgressExtprocService != "" || e.Cfg.ExperimentalEgressCredentialInjection) {
+	if running && (e.Cfg.AdditionalEgressExtprocService != "" || len(providers) > 0) {
 		if err := e.Kube.RolloutRestartDeployment(ctx, e.Namespace(), "atenet-egress", time.Now()); err != nil {
 			return err
 		}
@@ -375,8 +611,8 @@ const otelEndpointKey = "OTEL_EXPORTER_OTLP_ENDPOINT"
 
 // otelOverrideDeployments are the control plane Deployments that read
 // ate-otel-config. ate-controller additionally copies the values onto the
-// ateom worker pods it creates, so one patch reaches the whole system.
-var otelOverrideDeployments = []string{"ate-api-server", "ate-controller", "atenet-router"}
+// worker pods it creates, so one patch reaches the whole system.
+var otelOverrideDeployments = []string{"ate-api-server", "ate-controller", "atenet-router", "atenet-egress"}
 
 // applyOtelEndpointOverride points all control plane telemetry at a different
 // collector for the duration of a measurement. See
@@ -417,16 +653,5 @@ func (e *Env) applyOtelEndpointOverride(ctx context.Context) error {
 			return err
 		}
 	}
-	// atelet DaemonSet names carry a version suffix; restart whichever
-	// versions are installed.
-	daemonSets, err := e.Kube.DaemonSetNames(ctx, e.Namespace(), "app=atelet")
-	if err != nil {
-		return err
-	}
-	for _, name := range daemonSets {
-		if err := e.Kube.RolloutRestart(ctx, e.Namespace(), name, now); err != nil {
-			return err
-		}
-	}
-	return nil
+	return e.Kube.RolloutRestart(ctx, e.Namespace(), "atelet", now)
 }

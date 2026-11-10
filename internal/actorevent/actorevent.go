@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package actorevent emits the actor lifecycle events. Log writes both copies of
-// a record, the stdout one and the OTLP one, from a single call, so nothing
-// about a record is kept in step by hand. Ordinary component logs stay on
+// Package actorevent emits the actor events: the lifecycle events and the usage
+// samples. Log writes each record as an OTLP event when the logs exporter is on,
+// and on stdout otherwise, or in both places when asked to. Both forms are built
+// from the same call, so they cannot drift. Ordinary component logs stay on
 // stdout.
 //
 // This is not an slog bridge. A bridge would put every component record on the
@@ -29,29 +30,37 @@ package actorevent
 import (
 	"context"
 	"log/slog"
+	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
 
-	"github.com/agent-substrate/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/ateattr"
 )
 
-// ScopeName is how a consumer selects this stream.
-const ScopeName = "github.com/agent-substrate/substrate/internal/actorevent"
+// ScopeName is the instrumentation scope of every actor event. A consumer
+// selects a stream by event name.
+const ScopeName = "go.ate.dev/substrate/internal/actorevent"
 
 // Event is one name in the closed vocabulary. Name is the LogRecord's own event
 // name field, not an attribute. Body and Severity live here rather than at a
-// call site, so the two copies of a record cannot differ.
+// call site, so the stdout and OTLP forms of a record cannot differ.
 //
-// Keys is the attribute set the name promises. An event name means a fixed
-// shape, so the tests hold the two in step and a caller cannot widen the record.
+// Keys is the attribute set the name promises on every record. Conditional
+// holds the keys that are present exactly when the registry's condition holds,
+// and absent otherwise: absence means not measured, zero means measured as
+// zero. The tests hold both lists in step with the registry, and a caller cannot
+// widen the record.
 type Event struct {
-	Name     string
-	Body     string
-	Severity log.Severity
-	Keys     []string
+	Name        string
+	Body        string
+	Severity    log.Severity
+	Keys        []string
+	Conditional []string
 }
 
 // Level is the stdout level for this event. slog has four levels to OTel's
@@ -78,8 +87,9 @@ var identityKeys = []string{
 	string(ateattr.TemplateNameKey),
 }
 
-// Two names, because a crash has a different shape and severity. Only two,
-// because ate.actor.state already says which transition happened.
+// Three names. A crash is its own because it has a different severity; there
+// is no name per state, because ate.actor.state already says which transition
+// happened. UsageSampled is the workers' measurement record.
 var (
 	StateChanged = Event{
 		Name:     "ate.actor.state_changed",
@@ -98,11 +108,32 @@ var (
 			string(ateattr.ActorOperationNameKey),
 			string(ateattr.ActorStateKey)),
 	}
+
+	UsageSampled = Event{
+		Name:     "ate.actor.usage_sampled",
+		Body:     "Actor usage sampled",
+		Severity: log.SeverityInfo,
+		Keys: append(append([]string{}, identityKeys...),
+			string(ateattr.WorkerPoolNamespaceKey),
+			string(ateattr.WorkerPoolNameKey),
+			string(ateattr.SandboxClassKey),
+			string(ateattr.StatsSourceKey),
+			string(ateattr.StatsKindKey),
+			string(ateattr.ActorEpochKey)),
+		// Absent while the actor is not measurable, and peak also when the
+		// source cannot report one.
+		Conditional: []string{
+			string(ateattr.StatsMemoryUsageKey),
+			string(ateattr.StatsMemoryPeakKey),
+			string(ateattr.StatsMemoryWorkingSetKey),
+			string(ateattr.StatsCPUTimeKey),
+		},
+	}
 )
 
 // events is the whole vocabulary, which the registry test walks. An event left
 // out of it is never checked against docs/metrics/registry/events.yaml.
-var events = []Event{StateChanged, Crashed}
+var events = []Event{StateChanged, Crashed, UsageSampled}
 
 // BuildRecord turns the stdout record into its OTLP form. Attributes carry
 // everything machine-readable, so the body stays the display string.
@@ -114,75 +145,106 @@ func BuildRecord(ev Event, t time.Time, attrs []slog.Attr) log.Record {
 	rec.SetEventName(ev.Name)
 	rec.SetTimestamp(t)
 	rec.SetSeverity(ev.Severity)
-	rec.SetBody(log.StringValue(ev.Body))
+	rec.SetBody(attribute.StringValue(ev.Body))
 
-	kvs := make([]log.KeyValue, 0, len(attrs))
+	kvs := make([]attribute.KeyValue, 0, len(attrs))
 	for _, a := range attrs {
-		kvs = append(kvs, log.KeyValue{Key: a.Key, Value: logValue(a.Value)})
+		kvs = append(kvs, attribute.KeyValue{Key: attribute.Key(a.Key), Value: logValue(a.Value)})
 	}
 	rec.AddAttributes(kvs...)
 	return rec
 }
 
-// logValue keeps the kind slog's JSON handler writes, so the two copies match.
-func logValue(v slog.Value) log.Value {
+// logValue keeps the kind slog's JSON handler writes, so the two forms match.
+func logValue(v slog.Value) attribute.Value {
 	switch v.Kind() {
 	case slog.KindString:
-		return log.StringValue(v.String())
+		return attribute.StringValue(v.String())
 	case slog.KindInt64:
-		return log.Int64Value(v.Int64())
+		return attribute.Int64Value(v.Int64())
 	case slog.KindUint64:
-		return log.Int64Value(int64(v.Uint64()))
+		// OTel has no unsigned kind. Clamp rather than wrap, as the metric
+		// side does in addSat.
+		u := v.Uint64()
+		if u > math.MaxInt64 {
+			return attribute.Int64Value(math.MaxInt64)
+		}
+		return attribute.Int64Value(int64(u))
 	case slog.KindFloat64:
-		return log.Float64Value(v.Float64())
+		return attribute.Float64Value(v.Float64())
 	case slog.KindBool:
-		return log.BoolValue(v.Bool())
+		return attribute.BoolValue(v.Bool())
 	case slog.KindDuration:
 		// nanoseconds, not "1.5s"
-		return log.Int64Value(int64(v.Duration()))
+		return attribute.Int64Value(int64(v.Duration()))
 	default:
-		return log.StringValue(v.String())
+		return attribute.StringValue(v.String())
 	}
 }
 
-// Emitter writes the OTLP copy through one log.Logger. Tests construct one
+// Emitter writes the OTLP event through one log.Logger. Tests construct one
 // directly, so emit needs no global provider and can run in parallel.
 type Emitter struct {
 	logger log.Logger
+	// stdout writes the stdout record. Nil means slog.Default() at call time.
+	stdout slog.Handler
 }
 
+// NewEmitter writes under ScopeName, with the stdout record through
+// slog.Default().
 func NewEmitter(lp log.LoggerProvider) *Emitter {
 	return &Emitter{logger: lp.Logger(ScopeName)}
 }
 
-// Log writes both copies of ev from one call, off one time.Now(), so a consumer
-// can join them on an exact timestamp. That is why the stdout record is built
-// here rather than through slog.LogAttrs, which would take its own reading.
-//
-// --log-level=warn silences the stdout copy of an info event while the OTLP copy
-// still ships.
-func (e *Emitter) Log(ctx context.Context, ev Event, attrs []slog.Attr) {
-	now := time.Now()
-
-	level := ev.Level()
-	if l := slog.Default(); l.Enabled(ctx, level) {
-		rec := slog.NewRecord(now, level, ev.Body, 0)
-		rec.AddAttrs(attrs...)
-		_ = l.Handler().Handle(ctx, rec)
-	}
-
-	e.emit(ctx, ev, now, attrs)
+// NewEmitterTo is NewEmitter with the stdout record through stdout, for a
+// stream whose stdout record must not follow --log-level or block the caller.
+func NewEmitterTo(lp log.LoggerProvider, stdout slog.Handler) *Emitter {
+	return &Emitter{logger: lp.Logger(ScopeName), stdout: stdout}
 }
 
-// emit writes the OTLP copy. It is a no-op, and cheap, until InitLogging
-// installs a provider.
-func (e *Emitter) emit(ctx context.Context, ev Event, t time.Time, attrs []slog.Attr) {
-	params := log.EnabledParameters{Severity: ev.Severity, EventName: ev.Name}
-	if !e.logger.Enabled(ctx, params) {
+// LogAt writes ev as an OTLP event when the logs exporter takes it, and on
+// stdout otherwise, or both with SetConsole(true). t is when the thing
+// happened, such as a usage sample's read time, so the stdout record is built
+// here rather than through slog.LogAttrs, which would take its own reading.
+// With slog.Default() as the stdout handler, it follows --log-level.
+func (e *Emitter) LogAt(ctx context.Context, ev Event, t time.Time, attrs []slog.Attr) {
+	if e.emit(ctx, ev, t, attrs) && !console.Load() {
 		return
 	}
-	e.logger.Emit(ctx, BuildRecord(ev, t, attrs))
+	level := ev.Level()
+	h := e.stdout
+	if h == nil {
+		h = slog.Default().Handler()
+	}
+	if h.Enabled(ctx, level) {
+		rec := slog.NewRecord(t, level, ev.Body, 0)
+		rec.AddAttrs(attrs...)
+		_ = h.Handle(ctx, rec)
+	}
 }
+
+// Log is LogAt with time.Now(), for an event that happens as it is written.
+func (e *Emitter) Log(ctx context.Context, ev Event, attrs []slog.Attr) {
+	e.LogAt(ctx, ev, time.Now(), attrs)
+}
+
+// emit writes the OTLP event and reports whether it did. It does nothing, and
+// cheaply, until InitLogging installs a provider.
+func (e *Emitter) emit(ctx context.Context, ev Event, t time.Time, attrs []slog.Attr) bool {
+	params := log.EnabledParameters{Severity: ev.Severity, EventName: ev.Name}
+	if !e.logger.Enabled(ctx, params) {
+		return false
+	}
+	e.logger.Emit(ctx, BuildRecord(ev, t, attrs))
+	return true
+}
+
+// console makes LogAt write the stdout record beside the OTLP event.
+var console atomic.Bool
+
+// SetConsole sets whether an actor event's stdout record is also written when
+// its OTLP event is: OTEL_LOGS_EXPORTER=otlp,console. Call it once at startup.
+func SetConsole(on bool) { console.Store(on) }
 
 // The global provider delegates, so a Logger taken before InitLogging still
 // reaches the one it installs.
@@ -193,4 +255,9 @@ var defaultEmitter = sync.OnceValue(func() *Emitter {
 // Log records ev through the process-wide provider.
 func Log(ctx context.Context, ev Event, attrs []slog.Attr) {
 	defaultEmitter().Log(ctx, ev, attrs)
+}
+
+// LogAt records ev at t through the process-wide provider.
+func LogAt(ctx context.Context, ev Event, t time.Time, attrs []slog.Attr) {
+	defaultEmitter().LogAt(ctx, ev, t, attrs)
 }

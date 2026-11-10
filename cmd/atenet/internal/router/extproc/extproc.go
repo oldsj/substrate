@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -130,11 +130,8 @@ func (s *Server) processRequestHeaders(
 	start := time.Now()
 	md := NewRequestMetadata(reqHeaders.GetHeaders().GetHeaders(), req.GetAttributes())
 
-	// One atenet binary serves both directions, as two ext_proc handlers
-	// selected here. They are deployed separately today — atenet-router fronts
-	// the ingress dataplane, atenet-egress the egress gateway — because the two
-	// scale independently, and --mode restricts an instance to the direction
-	// its deployment fronts. Nothing stops a single instance from serving both.
+	// Both ingress and egress are built into one binary, but it will only
+	// handle one traffic direction (egress or ingress) per instance.
 	//
 	// Which handler runs is decided by the filter chain the dataplane says
 	// accepted the request, never by anything in the request itself (see

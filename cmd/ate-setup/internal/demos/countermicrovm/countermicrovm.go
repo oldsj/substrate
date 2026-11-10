@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,15 +14,13 @@
 
 // Package countermicrovm installs the micro-VM variant of the counter demo.
 //
-// It needs the cluster-wide `microvm` SandboxConfig that
-// hack/install-microvm-deps.sh --install creates. It has no external-volume
-// option: the CSI path is covered by demo-counter.
+// It has no external-volume option: the CSI path is covered by demo-counter.
 package countermicrovm
 
 import (
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/demos"
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/steps"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/demos"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/steps"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 // namespace is the pool's k8s namespace; it doubles as the atespace holding
@@ -32,7 +30,7 @@ const namespace = "ate-demo-counter-microvm"
 func init() {
 	demos.Register(&demos.Substrate{
 		DemoName:           "demo-counter-microvm",
-		Short:              "The counter demo on micro-VM workers (needs hack/install-microvm-deps.sh --install)",
+		Short:              "The counter demo on microVM workers",
 		WorkerPoolManifest: "demos/counter/counter-microvm.yaml.tmpl",
 		Deployments:        []steps.TemplateRef{{Atespace: namespace, Name: "counter-microvm"}},
 		Templates: []demos.SubstrateTemplate{{

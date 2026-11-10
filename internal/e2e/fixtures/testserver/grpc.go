@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/internal/proto/grpcechopb"
+	"go.ate.dev/substrate/internal/proto/grpcechopb"
 )
 
 // maxStreamCount bounds EchoStream. A test asks for a handful of messages; a

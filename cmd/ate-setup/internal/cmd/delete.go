@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ package cmd
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/demos"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/demos"
 )
 
 var deleteCmd = &cobra.Command{
@@ -48,7 +48,7 @@ var deleteAllCmd = &cobra.Command{
 	Short: "Delete every demo and then the core system",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
-		return env.DeleteAll(cmd.Context(), demos.Deleters(env.Cfg))
+		return env.DeleteAll(cmd.Context(), demos.Deleters())
 	},
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,16 +32,17 @@ const (
 
 // Filter chains of the egress gateway that call ext_proc; each is a leg of the
 // egress handler. Must match the chain names in
-// manifests/ate-install/atenet-egress.yaml and atenet-egress-with-sdsmint.yaml.
+// manifests/ate-install/atenet-egress.yaml.
 const (
 	// EgressFilterChainName terminates the actor's outer mTLS CONNECT: the
-	// certificate is authenticated and the address rules decided here.
+	// certificate is authenticated and the SNI rules for the dialed port
+	// handed to the dataplane here.
 	EgressFilterChainName = "egress"
-	// EgressTLSMITMFilterChainName is the sdsmint gateway's chain for TLS it
+	// EgressTLSMITMFilterChainName is the gateway's chain for TLS it
 	// terminated with a minted leaf. The handler authorizes every request.
 	EgressTLSMITMFilterChainName = "egress_tls_mitm"
 	// EgressCleartextFilterChainName is the chain for HTTP the actor sent in
-	// the clear, on both gateways. The handler authorizes every request.
+	// the clear. The handler authorizes every request.
 	EgressCleartextFilterChainName = "egress_cleartext"
 )
 

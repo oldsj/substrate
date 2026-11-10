@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 const (

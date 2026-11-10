@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,12 @@ import (
 	"io"
 	"text/tabwriter"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
 )
 
 // PrintEgressPolicyTo prints one actor's egress policy. json and yaml emit the
 // bare EgressPolicy. The policy carries no actor name, so the caller passes it.
-func PrintEgressPolicyTo(out io.Writer, actor string, policy *ateapipb.EgressPolicy, format string) error {
+func PrintEgressPolicyTo(out io.Writer, actor string, policy *ateapi.EgressPolicy, format string) error {
 	switch format {
 	case "json", "yaml":
 		return printProto(out, policy, format)

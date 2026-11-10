@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,8 +24,9 @@ def add_lifecycle_mode_arguments(parser: LocustArgumentParser) -> None:
     group.add_argument(
         "--lifecycle-mode",
         type=str,
-        default="suspend",
-        choices=["suspend", "pause"],
-        help="Lifecycle mode: 'suspend' uses SuspendActor (persists snapshot to storage); "
-        "'pause' uses PauseActor (keeps snapshot on local node) (default: suspend)",
+        default="async",
+        choices=["sync", "async", "none"],
+        help="Lifecycle mode: 'sync' uses synchronous SuspendActor (uploads snapshot before returning); "
+        "'async' uses asynchronous SuspendActor (uploads snapshot in background); "
+        "'none' keeps actors resident in memory between steps (default: async)",
     )

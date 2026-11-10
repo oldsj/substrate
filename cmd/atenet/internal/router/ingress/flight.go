@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,9 @@
 package ingress
 
 import (
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"sync/atomic"
+
+	"go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -34,21 +36,35 @@ type resumeActorFlight struct {
 	// retryingSignaled guards the single close of retrying; only the flight
 	// goroutine touches it.
 	retryingSignaled bool
-	done             chan struct{}
-	result           *resumeCallResult
+	// lastRetryErr is the latest retryable failure. The flight goroutine
+	// writes it and a caller that is shed reads it.
+	lastRetryErr atomic.Pointer[error]
+	done         chan struct{}
+	result       *resumeCallResult
 }
 
 func newResumeActorFlight() *resumeActorFlight {
 	return &resumeActorFlight{retrying: make(chan struct{}), done: make(chan struct{})}
 }
 
-// signalRetrying is idempotent; only the flight goroutine calls it.
-func (f *resumeActorFlight) signalRetrying() {
+// signalRetrying records err as the latest retryable failure, then closes
+// retrying. The store comes first, so a caller that sees retrying closed also
+// sees err. It is idempotent; only the flight goroutine calls it.
+func (f *resumeActorFlight) signalRetrying(err error) {
+	f.lastRetryErr.Store(&err)
 	if f.retryingSignaled {
 		return
 	}
 	f.retryingSignaled = true
 	close(f.retrying)
+}
+
+// retryErr returns the latest retryable failure, or nil if there is none.
+func (f *resumeActorFlight) retryErr() error {
+	if p := f.lastRetryErr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // callerResult classifies f's completed outcome for one caller. It must only
@@ -59,7 +75,7 @@ func (f *resumeActorFlight) signalRetrying() {
 // resume reports "unknown": the gRPC code alone does not carry the fact. A
 // canceled leader's flight outlives its request and keeps restoring the actor,
 // and a DeadlineExceeded can land in the middle of a restore.
-func (f *resumeActorFlight) callerResult(reqID uint64) (*ateapipb.Actor, ResumeOutcome, error) {
+func (f *resumeActorFlight) callerResult(reqID uint64) (*ateapi.Actor, ResumeOutcome, error) {
 	res := f.result
 	if res == nil {
 		return nil, ResumeOutcomeUnknown, status.Error(codes.Internal, "resume call returned nil result")

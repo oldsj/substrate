@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,14 +20,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/benchmarking/boomer/userclass"
-	"github.com/agent-substrate/substrate/internal/benchmarking/glutton/fake"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/boomerutil"
+	"go.ate.dev/substrate/internal/benchmarking/boomer/userclass"
+	"go.ate.dev/substrate/internal/benchmarking/glutton/fake"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 func conflictErr() error {
-	return status.Error(codes.Aborted, concurrentUpdateMsg)
+	return status.Error(codes.Aborted, boomerutil.ConcurrentUpdateMsg)
 }
 
 func newResumeTestActor(t *testing.T, resumeErrs ...error) (*gluttonActor, *fakeControlClient) {
@@ -54,8 +55,8 @@ func TestResumeRetriesConcurrentUpdateConflict(t *testing.T) {
 	if got := resumeCalls(fakeCtrl); got != 3 {
 		t.Errorf("ResumeActor calls = %d, want 3 (two conflicts, then success)", got)
 	}
-	if elapsed < resumeMaxBackoff {
-		t.Errorf("elapsed = %v, want >= %v (second retry must back off)", elapsed, resumeMaxBackoff)
+	if elapsed < boomerutil.ConflictRetryBackoff {
+		t.Errorf("elapsed = %v, want >= %v (second retry must back off)", elapsed, boomerutil.ConflictRetryBackoff)
 	}
 	if u.crashed {
 		t.Error("crashed = true after a transient conflict")
@@ -74,7 +75,7 @@ func TestResumeDoesNotRetryOtherErrors(t *testing.T) {
 }
 
 func TestResumeGivesUpAfterMaxAttempts(t *testing.T) {
-	errs := make([]error, resumeMaxAttempts+1)
+	errs := make([]error, boomerutil.ConflictRetryAttempts+1)
 	for i := range errs {
 		errs[i] = conflictErr()
 	}
@@ -83,8 +84,8 @@ func TestResumeGivesUpAfterMaxAttempts(t *testing.T) {
 	if err := u.resume(context.Background()); err == nil {
 		t.Fatal("resume = nil, want an error when every attempt conflicts")
 	}
-	if got := resumeCalls(fakeCtrl); got != resumeMaxAttempts {
-		t.Errorf("ResumeActor calls = %d, want %d", got, resumeMaxAttempts)
+	if got := resumeCalls(fakeCtrl); got != boomerutil.ConflictRetryAttempts {
+		t.Errorf("ResumeActor calls = %d, want %d", got, boomerutil.ConflictRetryAttempts)
 	}
 }
 

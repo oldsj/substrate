@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,7 +41,7 @@ var transactionControl = regexp.MustCompile(`(?im)^\s*(BEGIN|START\s+TRANSACTION
 //
 // Why this is needed:
 //  1. Substrate manages the OpenFGA PostgreSQL tables directly in
-//     migrations/000002_openfga.sql (rather than running OpenFGA's embedded Goose
+//     migrations/000001_initial.sql (rather than running OpenFGA's embedded Goose
 //     migrations) so that OpenFGA tables and Substrate resource tables live in
 //     the same PostgreSQL schema and migration ledger.
 //  2. cmd/ateapi/internal/authz/datastore.go adapts upstream postgres.Datastore
@@ -75,7 +75,7 @@ func TestOpenFGAMigrationVersionGuard(t *testing.T) {
 	}
 	if maxVersion != pinnedOpenFGAMigrationVersion {
 		t.Fatalf(
-			"OpenFGA embedded PostgreSQL migrations are at version %d, but 000002_openfga.sql and cmd/ateapi/internal/authz/datastore.go are pinned to version %d; port any new OpenFGA DDL to cmd/ateapi/internal/store/atepg/migrations/ and verify TransactionalDatastore before updating pinnedOpenFGAMigrationVersion",
+			"OpenFGA embedded PostgreSQL migrations are at version %d, but 000001_initial.sql and cmd/ateapi/internal/authz/datastore.go are pinned to version %d; port any new OpenFGA DDL to cmd/ateapi/internal/store/atepg/migrations/ and verify TransactionalDatastore before updating pinnedOpenFGAMigrationVersion",
 			maxVersion, pinnedOpenFGAMigrationVersion,
 		)
 	}
@@ -133,7 +133,7 @@ func TestMigrationsConcurrentStartup(t *testing.T) {
 	errs := make(chan error, 2)
 	for range 2 {
 		go func() {
-			p, err := Connect(ctx, containerDSN, "concurrent-startup")
+			p, err := Connect(ctx, testConnectConfig("concurrent-startup"))
 			if p != nil {
 				p.Close()
 				p.pool.Close()
@@ -233,7 +233,7 @@ func TestMigrationSchemaStates(t *testing.T) {
 			_, _ = pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS "migration-ahead" CASCADE`)
 		})
 
-		p, err := Connect(ctx, containerDSN, "migration-ahead")
+		p, err := Connect(ctx, testConnectConfig("migration-ahead"))
 		if err != nil {
 			t.Fatalf("creating current schema: %v", err)
 		}
@@ -243,7 +243,7 @@ func TestMigrationSchemaStates(t *testing.T) {
 			t.Fatalf("setting ahead migration state: %v", err)
 		}
 
-		p, err = Connect(ctx, containerDSN, "migration-ahead")
+		p, err = Connect(ctx, testConnectConfig("migration-ahead"))
 		if err != nil {
 			t.Fatalf("Connect with an ahead clean schema failed: %v", err)
 		}
@@ -262,7 +262,7 @@ func TestMigrationSchemaStates(t *testing.T) {
 			_, _ = pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS "migration-legacy" CASCADE`)
 		})
 
-		_, err := Connect(ctx, containerDSN, "migration-legacy")
+		_, err := Connect(ctx, testConnectConfig("migration-legacy"))
 		if err == nil || !strings.Contains(err.Error(), "Substrate tables exist without a migration ledger") {
 			t.Fatalf("Connect error = %v, want unsupported schema error", err)
 		}

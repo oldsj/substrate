@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ package steps
 import (
 	"context"
 
-	"github.com/agent-substrate/substrate/internal/ateclient"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/internal/ateclient"
 )
 
 // TemplateRef identifies a demo's ActorTemplate. Actors are deleted by matching
@@ -33,14 +33,13 @@ type TemplateRef struct {
 }
 
 // listAllActors pages through every actor in every atespace.
-func listAllActors(ctx context.Context, client *ateclient.Client) ([]*ateapipb.Actor, error) {
-	var all []*ateapipb.Actor
+func listAllActors(ctx context.Context, client *ateclient.Client) ([]*ateapi.Actor, error) {
+	var all []*ateapi.Actor
 	pageToken := ""
 	for {
 		// An empty Atespace lists across all atespaces.
-		resp, err := client.ListActors(ctx, &ateapipb.ListActorsRequest{
-			PageSize:  1000,
-			PageToken: pageToken,
+		resp, err := client.ListActors(ctx, &ateapi.ListActorsRequest{
+			Options: &ateapi.ListOptions{PageSize: 1000, PageToken: pageToken},
 		})
 		if err != nil {
 			return nil, err

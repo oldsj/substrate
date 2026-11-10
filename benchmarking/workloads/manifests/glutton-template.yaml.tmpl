@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,27 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ActorTemplate (protojson-shaped ateapipb.ActorTemplate) for the glutton
+# ActorTemplate (protojson-shaped ateapi.ActorTemplate) for the glutton
 # benchmark workload, created through the ate API by workloads/deploy.sh.
-# The sandbox class must match the WorkerPool's so snapshots stay within a
-# class.
 metadata:
   atespace: benchmark-workloads
   name: glutton
 workerSelector:
   matchLabels:
-    workload: benchmark-ateom
+    workload: benchmark-worker
 containers:
 - name: glutton
-  image: ko://github.com/agent-substrate/substrate/cmd/benchmarking/glutton
+  image: ko://go.ate.dev/substrate/cmd/benchmarking/glutton
   # Port 80 is the only inbound port nftables forwards from the worker pod
-  # into the actor sandbox (see cmd/ateom-gvisor/main.go). HTTP/1.1 mode
+  # into the actor sandbox (see cmd/ateworker-gvisor/main.go). HTTP/1.1 mode
   # lets the atenet router (which forwards HTTP/1.1 upstream) reach Ping.
   command:
   - "/ko-app/glutton"
   - "--grpc-listen-addr=:80"
   - "--metrics-listen-addr=:9090"
-  - "--data-dir=/tmp/glutton"
+  # No volume is mounted here, so WriteDisk files go to the container's
+  # rootfs upper layer. /tmp is a tmpfs and would count them as memory.
+  - "--data-dir=/var/lib/glutton"
   - "--mode=http"
   # Substrate puts no OTLP configuration in an actor container:
   # resolveActorEnv in cmd/atelet/oci.go merges the env of the ActorTemplate
@@ -53,17 +53,11 @@ containers:
     httpGet:
       path: /readyz
       port: 80
-# See the note on the sleep template: unset means the 2 GiB microvm default,
-# which the benchmarks should not silently inherit. Raise ${ACTOR_MEMORY}
-# for suites that exercise glutton's WriteRAM path.
+# See the note on the sleep template. Raise ${ACTOR_MEMORY} for suites that
+# exercise glutton's WriteRAM path.
 resources:
   limits:
-  - name: memory
-    quantity: ${ACTOR_MEMORY}
+    cpuMillicores: "${ACTOR_CPU_MILLICORES}"
+    memoryBytes: "${ACTOR_MEMORY_BYTES}"
 snapshotConfig:
-  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
-  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
-  storageLocation: gs://${BUCKET_NAME}/benchmark-workloads/glutton/
-sandboxConfig:
-  sandboxClass: ${SANDBOX_CLASS_ENUM}
-  configName: ${SANDBOX_CONFIG_NAME}
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY

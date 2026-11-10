@@ -1,4 +1,4 @@
-// Copyright 2026 Google LLC
+// Copyright 2026 The Agent Substrate Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,59 +15,44 @@
 package lint
 
 import (
-	"strings"
-
-	"github.com/agent-substrate/substrate/tools/apitool/internal/model"
+	"go.ate.dev/substrate/tools/apitool/internal/model"
 )
 
-// Documented requires every message, enum, message field, and RPC method
-// to have a doc comment.
 var Documented = Rule{
 	Name:        "documented",
 	Description: "Every message, enum, message field, and RPC method has a doc comment.",
-	Check:       checkDocumented,
+	Check: allOf(
+		forEachMessage(checkMessageDocumented),
+		forEachField(checkFieldDocumented),
+		forEachEnum(checkEnumDocumented),
+		forEachMethod(checkMethodDocumented),
+	),
 }
 
-func checkDocumented(api *model.API) ([]Finding, error) {
-	var findings []Finding
-	for _, m := range api.Messages {
-		if docText(m.Comment) == "" {
-			findings = append(findings, Finding{Subject: m.FullName, Message: "message has no doc comment"})
-		}
-		for _, f := range m.Fields {
-			if docText(f.Comment) == "" {
-				findings = append(findings, Finding{Subject: m.FullName + "." + f.Name, Message: "field has no doc comment"})
-			}
-		}
+func checkMessageDocumented(m model.Message) []Finding {
+	if model.PublicDoc(m.Comment) == "" {
+		return []Finding{findingf(m.FullName, "message has no doc comment")}
 	}
-	for _, e := range api.Enums {
-		if docText(e.Comment) == "" {
-			findings = append(findings, Finding{Subject: e.FullName, Message: "enum has no doc comment"})
-		}
-	}
-	for _, svc := range api.Services {
-		for _, method := range svc.Methods {
-			if docText(method.Comment) == "" {
-				findings = append(findings, Finding{Subject: method.ServiceFullName + "." + method.Name, Message: "method has no doc comment"})
-			}
-		}
-	}
-	return findings, nil
+	return nil
 }
 
-func docText(comment string) string {
-	var kept []string
-	for _, line := range strings.Split(comment, "\n") {
-		if isValidationGenTag(line) {
-			continue
-		}
-		kept = append(kept, line)
+func checkFieldDocumented(m model.Message, f model.Field) []Finding {
+	if model.PublicDoc(f.Comment) == "" {
+		return []Finding{findingf(m.FullName.Append(f.Name), "field has no doc comment")}
 	}
-	return strings.TrimSpace(strings.Join(kept, "\n"))
+	return nil
 }
 
-// isValidationGenTag reports whether line is a validation-gen Declarative
-// Validation tag, e.g. "+k8s:required" or "+k8s:format=k8s-short-name".
-func isValidationGenTag(line string) bool {
-	return strings.HasPrefix(strings.TrimSpace(line), "+k8s:")
+func checkEnumDocumented(e model.Enum) []Finding {
+	if model.PublicDoc(e.Comment) == "" {
+		return []Finding{findingf(e.FullName, "enum has no doc comment")}
+	}
+	return nil
+}
+
+func checkMethodDocumented(rpc model.Method) []Finding {
+	if model.PublicDoc(rpc.Comment) == "" {
+		return []Finding{findingf(subjectOf(rpc), "method has no doc comment")}
+	}
+	return nil
 }

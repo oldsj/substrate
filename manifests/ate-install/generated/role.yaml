@@ -1,4 +1,4 @@
-# Copyright 2026 Google LLC
+# Copyright 2026 The Agent Substrate Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,11 +22,18 @@ rules:
   - ""
   resources:
   - pods
-  - secrets
   verbs:
+  - delete
   - get
   - list
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - serviceaccounts
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - apps
   resources:
@@ -38,6 +45,21 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+- apiGroups:
+  - ate.dev
+  resources:
+  - sandboxconfigs
+  verbs:
+  - get
+  - list
+  - patch
   - watch
 - apiGroups:
   - ate.dev
@@ -86,6 +108,13 @@ rules:
   verbs:
   - attest
 - apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - networking.k8s.io
   resources:
   - networkpolicies
@@ -104,6 +133,16 @@ metadata:
   name: ate-controller
   namespace: ate-system
 rules:
+- apiGroups:
+  - ""
+  resourceNames:
+  - egress-mitm-ca-pool
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - discovery.k8s.io
   resources:
